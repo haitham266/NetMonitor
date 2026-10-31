@@ -1,10 +1,12 @@
-name: Build Windows EXE
+name: Build Windows Installer
 
 on:
   push:
     branches: [ main ]
     paths:
       - 'net_monitor.py'
+      - 'installer.iss'
+      - 'icon.ico'
       - '.github/workflows/build-windows.yml'
   workflow_dispatch:
 
@@ -22,9 +24,20 @@ jobs:
         run: pip install pyinstaller
 
       - name: Build EXE
-        run: pyinstaller --onefile --noconsole --name NetMonitor net_monitor.py
+        run: pyinstaller --onefile --noconsole --name NetMonitor --icon icon.ico net_monitor.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build Installer
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup 6\ISCC.exe","C:\Program Files\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found" }
+          & $iscc.FullName installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NetMonitor-Windows
-          path: dist/NetMonitor.exe
+          name: NetMonitor-Setup
+          path: dist/NetMonitor-Setup.exe
