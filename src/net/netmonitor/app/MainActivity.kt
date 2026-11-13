@@ -336,6 +336,7 @@ class MonitorService : Service() {
 
     override fun onDestroy() {
         running = false
+        try { stopForeground(true) } catch (e: Exception) { }
         try { wl?.release() } catch (e: Exception) { }
         try { wifiLock?.release() } catch (e: Exception) { }
         super.onDestroy()
@@ -855,6 +856,7 @@ class MainActivity : Activity() {
         })
         header.addView(actionBtn("🔋") { askBatteryExemption(true) })
         header.addView(actionBtn("⚙️") { settings() })
+        header.addView(actionBtn("⏻") { confirmExit() })
         root.addView(header)
 
         banner = TextView(this).apply {
@@ -1076,6 +1078,29 @@ class MainActivity : Activity() {
         super.onPause()
         ui.removeCallbacks(tick)
         // الخدمة تستمر بالعمل بالخلفية
+    }
+
+    // ---------- الخروج: نهائي أو تشغيل بالخلفية ----------
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() = confirmExit()
+
+    private fun confirmExit() {
+        AlertDialog.Builder(this)
+            .setTitle("الخروج من التطبيق")
+            .setMessage("خروج نهائي: يوقف المراقبة والتنبيهات تماماً حتى تفتح التطبيق مرة أخرى.\n\nتشغيل بالخلفية: يغلق الواجهة وتستمر المراقبة والتنبيهات.")
+            .setPositiveButton("⏻ خروج نهائي") { _, _ -> exitCompletely() }
+            .setNeutralButton("بالخلفية") { _, _ -> moveTaskToBack(true) }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
+    private fun exitCompletely() {
+        ui.removeCallbacks(tick)
+        // enabled=false يمنع إعادة التشغيل التلقائي (بعد إعادة تشغيل الجوال أو سحب التطبيق)
+        prefs.edit().putBoolean("enabled", false).commit()
+        try { stopService(Intent(this, MonitorService::class.java)) } catch (e: Exception) { }
+        try { (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(1) } catch (e: Exception) { }
+        finishAndRemoveTask()
     }
 
     // ---------- تحديث الواجهة من البيانات المشتركة ----------
