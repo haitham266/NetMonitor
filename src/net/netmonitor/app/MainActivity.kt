@@ -30,6 +30,7 @@ import android.provider.Settings
 import android.text.Html
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.widget.*
 import java.io.IOException
 import java.io.InputStream
@@ -339,9 +340,10 @@ fun rosConnect(prefs: SharedPreferences): Ros {
 
 class RouterCfg(
     val id: String, var name: String, var local: String, var cloud: String, var port: String,
-    var user: String, var pass: String, var wan: String, var modems: String
+    var user: String, var pass: String, var wan: String, var modems: String,
+    var nErr: Boolean = true, var nWarn: Boolean = false
 ) {
-    fun sig() = listOf(local, cloud, port, user, pass).joinToString("|")
+    fun sig() = listOf(local, cloud, port, user, pass, nErr, nWarn).joinToString("|")
     fun title() = name.ifBlank { local.ifBlank { cloud.ifBlank { "راوتر" } } }
     fun address() = local.ifBlank { cloud }
 }
@@ -357,7 +359,7 @@ object Routers {
             for (i in 0 until a.length()) {
                 val o = a.getJSONObject(i)
                 out.add(RouterCfg(o.getString("id"), o.optString("name"), o.optString("local"), o.optString("cloud"),
-                    o.optString("port", "8728"), o.optString("user"), o.optString("pass"), o.optString("wan", "ether1"), o.optString("modems")))
+                    o.optString("port", "8728"), o.optString("user"), o.optString("pass"), o.optString("wan", "ether1"), o.optString("modems"), o.optBoolean("nErr", true), o.optBoolean("nWarn", false)))
             }
         } catch (e: Exception) { }
         return out
@@ -366,7 +368,7 @@ object Routers {
     fun save(ctx: Context, list: List<RouterCfg>) {
         val a = org.json.JSONArray()
         for (r in list) a.put(org.json.JSONObject().put("id", r.id).put("name", r.name).put("local", r.local).put("cloud", r.cloud)
-            .put("port", r.port).put("user", r.user).put("pass", r.pass).put("wan", r.wan).put("modems", r.modems))
+            .put("port", r.port).put("user", r.user).put("pass", r.pass).put("wan", r.wan).put("modems", r.modems).put("nErr", r.nErr).put("nWarn", r.nWarn))
         sp(ctx).edit().putString("list", a.toString()).apply()
     }
 
@@ -377,7 +379,7 @@ object Routers {
     fun fromCfg(ctx: Context, id: String, keepPass: Boolean = true): RouterCfg {
         val p = cfg(ctx)
         fun g(k: String, d: String = "") = p.getString(k, d) ?: d
-        return RouterCfg(id, g("name"), g("local"), g("cloud"), g("port", "8728"), g("user"), if (keepPass) g("pass") else "", g("wan", "ether1"), g("modems"))
+        return RouterCfg(id, g("name"), g("local"), g("cloud"), g("port", "8728"), g("user"), if (keepPass) g("pass") else "", g("wan", "ether1"), g("modems"), p.getBoolean("notif_err", true), p.getBoolean("notif_warn", false))
     }
 
     // الإعدادات القديمة (راوتر واحد) تصير أول راوتر محفوظ
@@ -404,7 +406,7 @@ object Routers {
 
     fun applyToCfg(ctx: Context, r: RouterCfg) {
         cfg(ctx).edit().putString("name", r.name).putString("local", r.local).putString("cloud", r.cloud).putString("port", r.port)
-            .putString("user", r.user).putString("pass", r.pass).putString("wan", r.wan).putString("modems", r.modems).apply()
+            .putString("user", r.user).putString("pass", r.pass).putString("wan", r.wan).putString("modems", r.modems).putBoolean("notif_err", r.nErr).putBoolean("notif_warn", r.nWarn).apply()
     }
 }
 
@@ -873,9 +875,7 @@ class MonitorService : Service() {
                         toLogEntry(m)?.let { e ->
                             if (e.id > lastId) {
                                 lastId = e.id
-                                val wantErr = prefs.getBoolean("notif_err", true)
-                                val wantWarn = prefs.getBoolean("notif_warn", false)
-                                if ((e.level == 2 && wantErr) || (e.level == 1 && wantWarn)) pend.add(e)
+                                if ((e.level == 2 && w.cfg.nErr) || (e.level == 1 && w.cfg.nWarn)) pend.add(e)
                             }
                         }
                         flush(false)
@@ -1156,7 +1156,7 @@ class MainActivity : Activity() {
             startMonitor()
         })
         header.addView(actionBtn("🔋") { askBatteryExemption(true) })
-        header.addView(actionBtn("🔀") { routersSheet() })
+        header.addView(actionBtn("🔀") { routersScreen() })
         header.addView(actionBtn("⚙️") { settings() })
         header.addView(actionBtn("✖ خروج") { confirmExit() }.apply {
             setTextColor(c("#ffffff")); setTypeface(null, Typeface.BOLD); textSize = 13f
@@ -1361,8 +1361,8 @@ class MainActivity : Activity() {
         ifSection.addView(ifContainer)
         root.addView(ifSection, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
 
-        if (!prefs.contains("user")) settings() else askBatteryExemption(false)
         if (intent?.getBooleanExtra("open_log", false) == true) ui.post { openLog() }
+        else ui.post { routersScreen(); if (Routers.load(this).isEmpty()) loginPage(null) }
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -2045,168 +2045,252 @@ class MainActivity : Activity() {
         applyConfigChange()
     }
 
-    // قائمة الراوترات المحفوظة (ورقة من الأسفل)
-    private fun routersSheet() {
-        Routers.ensure(this)
-        val d = android.app.Dialog(this, android.R.style.Theme_DeviceDefault_Light_Dialog)
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            background = grad("#ffffff", "#e8f0ff", 26)
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-        }
-        root.addView(TextView(this).apply { text = "🔀 راوتراتي المحفوظة"; setTextColor(c("#1f2a44")); textSize = 17f; setTypeface(null, Typeface.BOLD) })
-        val list = Routers.load(this)
-        val act = Routers.activeId(this)
-        if (list.isEmpty()) note(root, "لا توجد راوترات محفوظة بعد")
-        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        for (r in list) {
-            val isAct = r.id == act
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), dp(10), dp(12), dp(10))
-                background = if (isAct) grad("#18be82", "#109664", 16) else grad("#ffffff", "#dbe6fb", 16)
-                isClickable = true
-                setOnClickListener { d.dismiss(); if (!isAct) switchRouter(r) }
-            }
-            val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; layoutParams = LinearLayout.LayoutParams(0, -2, 1f) }
-            info.addView(TextView(this).apply {
-                text = (if (isAct) "✅ " else "📡 ") + r.title(); textSize = 15f; setTypeface(null, Typeface.BOLD)
-                setTextColor(c(if (isAct) "#ffffff" else "#1f2a44"))
-            })
-            info.addView(TextView(this).apply {
-                text = "${r.address()} • ${r.user}:${r.port}"; textSize = 12f
-                setTextColor(c(if (isAct) "#e6f6ee" else "#64708a")); textDirection = View.TEXT_DIRECTION_LTR
-            })
-            row.addView(info)
-            row.addView(TextView(this).apply {
-                text = if (isAct) "الحالي" else "↩ دخول"; textSize = 12f; setTextColor(c("#ffffff"))
-                setPadding(dp(10), dp(5), dp(10), dp(5)); background = grad(if (isAct) "#0e7a52" else "#1e6eff", if (isAct) "#0b5e40" else "#0a32be", 12)
-            })
-            row.addView(TextView(this).apply {
-                text = "🗑"; textSize = 16f; setPadding(dp(10), dp(5), dp(6), dp(5))
-                setOnClickListener { confirmDeleteRouter(r, d) }
-            })
-            listBox.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-        }
-        root.addView(ScrollView(this).apply { addView(listBox) }, LinearLayout.LayoutParams(-1, -2))
-        root.addView(TextView(this).apply {
-            text = "➕ إضافة راوتر"; textSize = 15f; gravity = Gravity.CENTER; setTypeface(null, Typeface.BOLD); setTextColor(c("#ffffff"))
-            setPadding(0, dp(12), 0, dp(12)); background = grad("#1e6eff", "#0a32be", 16)
-            setOnClickListener { d.dismiss(); settings(true) }
-        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+    private var routersDlg: android.app.Dialog? = null
+
+    private fun fullDialog(root: View): android.app.Dialog {
+        val d = android.app.Dialog(this, android.R.style.Theme_DeviceDefault_Light_NoActionBar)
         d.setContentView(root)
-        d.window?.apply {
-            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
-            setGravity(Gravity.BOTTOM)
-            setLayout(android.view.WindowManager.LayoutParams.MATCH_PARENT, android.view.WindowManager.LayoutParams.WRAP_CONTENT)
+        d.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        return d
+    }
+
+    // الشاشة الأولى: قائمة الراوترات المحفوظة (اضغط راوتر للدخول)
+    private fun routersScreen() {
+        Routers.ensure(this)
+        routersDlg?.dismiss()
+        val frame = FrameLayout(this).apply { setBackgroundColor(c("#EEF3FB")); layoutDirection = View.LAYOUT_DIRECTION_RTL }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(12), dp(14), dp(12)) }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(12), dp(12), dp(12)); background = grad(NAV1, NAV2, 24)
         }
+        val ht = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; layoutParams = LinearLayout.LayoutParams(0, -2, 1f) }
+        ht.addView(TextView(this).apply { text = "Net Microtik Monitor"; setTextColor(c("#ffffff")); textSize = 18f; setTypeface(null, Typeface.BOLD) })
+        ht.addView(TextView(this).apply { text = "اختر الراوتر للمراقبة"; setTextColor(c("#b8c6e6")); textSize = 12f })
+        head.addView(ht)
+        head.addView(TextView(this).apply {
+            text = "✖ خروج"; setTextColor(c("#ffffff")); textSize = 13f; setTypeface(null, Typeface.BOLD)
+            setPadding(dp(12), dp(6), dp(12), dp(6)); background = grad("#ff6a5c", "#d6362a", 14)
+            setOnClickListener { confirmExit() }
+        })
+        col.addView(head)
+        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(ScrollView(this).apply { addView(listBox) }, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(10) })
+        frame.addView(col, FrameLayout.LayoutParams(-1, -1))
+        val d = fullDialog(frame)
+        frame.addView(TextView(this).apply {
+            text = "+"; textSize = 30f; setTextColor(c("#ffffff")); gravity = Gravity.CENTER
+            background = grad("#1e6eff", "#0a32be", 22)
+            setOnClickListener { loginPage(null) }
+        }, FrameLayout.LayoutParams(dp(64), dp(64), Gravity.BOTTOM or Gravity.LEFT).apply { leftMargin = dp(18); bottomMargin = dp(22) })
+        d.setOnKeyListener { _, k, ev -> if (k == android.view.KeyEvent.KEYCODE_BACK && ev.action == android.view.KeyEvent.ACTION_UP) { confirmExit(); true } else k == android.view.KeyEvent.KEYCODE_BACK }
+        routersDlg = d
+        refreshRoutersScreen(listBox)
         d.show()
     }
 
-    private fun confirmDeleteRouter(r: RouterCfg, sheet: android.app.Dialog) {
+    private fun refreshRoutersScreen(box: LinearLayout? = null) {
+        val listBox = box ?: ((routersDlg?.window?.decorView?.let { findFirstLinear(it) }) ?: return)
+        listBox.removeAllViews()
+        val list = Routers.load(this)
+        val act = Routers.activeId(this)
+        if (list.isEmpty()) note(listBox, "لا توجد راوترات محفوظة. اضغط + لإضافة راوتر.")
+        for (r in list) {
+            val isAct = r.id == act
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(14), dp(12), dp(10), dp(12))
+                background = if (isAct) grad("#e9fbf3", "#c9f1de", 20) else grad("#ffffff", "#e8f0ff", 20)
+                isClickable = true
+                setOnClickListener { enterRouter(r) }
+            }
+            card.addView(TextView(this).apply {
+                text = "📡"; textSize = 22f; gravity = Gravity.CENTER; setPadding(dp(10), dp(8), dp(10), dp(8))
+                background = grad("#dbe6fb", "#c3d6f7", 16)
+            })
+            val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(10); rightMargin = dp(10) } }
+            info.addView(TextView(this).apply { text = r.title() + if (isAct) "  ● مراقَب الآن" else ""; textSize = 16f; setTypeface(null, Typeface.BOLD); setTextColor(c(if (isAct) "#0f7a50" else "#1f2a44")) })
+            info.addView(TextView(this).apply { text = "${r.user}@${r.address()}:${r.port}"; textSize = 12f; setTextColor(c("#64708a")); textDirection = View.TEXT_DIRECTION_LTR })
+            card.addView(info)
+            card.addView(TextView(this).apply {
+                text = "✏️"; textSize = 18f; setPadding(dp(10), dp(6), dp(10), dp(6))
+                setOnClickListener { loginPage(r.id) }
+            })
+            card.addView(TextView(this).apply {
+                text = "🗑"; textSize = 18f; setPadding(dp(10), dp(6), dp(6), dp(6))
+                setOnClickListener { confirmDeleteRouter(r) }
+            })
+            listBox.addView(card, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
+        }
+    }
+
+    private fun findFirstLinear(v: View): LinearLayout? {
+        if (v is ScrollView) return v.getChildAt(0) as? LinearLayout
+        if (v is ViewGroup) for (i in 0 until v.childCount) findFirstLinear(v.getChildAt(i))?.let { return it }
+        return null
+    }
+
+    private fun enterRouter(r: RouterCfg) {
+        if (r.id != Routers.activeId(this)) switchRouter(r) else { startMonitor(); Shared.forceModem = true }
+        routersDlg?.dismiss(); routersDlg = null
+        askBatteryExemption(false)
+    }
+
+    private fun confirmDeleteRouter(r: RouterCfg) {
         AlertDialog.Builder(this, R.style.NMDialog)
             .setTitle("حذف الراوتر")
             .setMessage("حذف \"${r.title()}\" من القائمة المحفوظة؟")
             .setPositiveButton("حذف") { _, _ ->
                 val wasActive = r.id == Routers.activeId(this)
                 Routers.remove(this, r.id)
-                sheet.dismiss()
                 val rest = Routers.load(this)
                 if (wasActive) {
-                    if (rest.isNotEmpty()) switchRouter(rest[0])
+                    if (rest.isNotEmpty()) { Routers.applyToCfg(this, rest[0]); Routers.setActive(this, rest[0].id) }
                     else {
                         prefs.edit().remove("user").remove("pass").remove("local").remove("cloud").apply()
-                        applyConfigChange(); settings(true)
+                        Routers.setActive(this, "")
                     }
+                    applyConfigChange()
                 }
+                refreshRoutersScreen()
             }
             .setNegativeButton("إلغاء", null)
             .show()
     }
 
-    private fun settings(newMode: Boolean = false) {
-        val defs = mapOf("port" to "8728", "wan" to "ether1", "modems" to DEFAULT_MODEMS)
-        val d = android.app.Dialog(this, android.R.style.Theme_DeviceDefault_Light_NoActionBar)
+    private fun lbl(label: String, e: EditText): FrameLayout {
+        val fr = FrameLayout(this)
+        e.apply { setHintTextColor(c("#a3adc2")); setTextColor(c("#1f2a44")); textSize = 14f; setPadding(dp(12), dp(10), dp(12), dp(8)); background = box("#ffffff", "#9fb3d9", 14) }
+        fr.addView(e, FrameLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        fr.addView(TextView(this).apply {
+            text = label; textSize = 11f; setTextColor(c("#1e6eff")); setBackgroundColor(c("#EEF3FB")); setPadding(dp(4), 0, dp(4), 0)
+        }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { marginStart = dp(12) })
+        return fr
+    }
+
+    private fun pageShell(title: String, onClose: () -> Unit): Pair<LinearLayout, LinearLayout> {
         val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            setBackgroundColor(c("#EEF3FB"))
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(c("#EEF3FB")); layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(14), dp(8), dp(10), dp(8)); background = grad(NAV1, NAV2, 22)
         }
-        head.addView(TextView(this).apply {
-            text = if (newMode) "➕ إضافة راوتر" else "⚙️ إعدادات الشبكة والمراقبة"; setTextColor(c("#ffffff")); textSize = 16f
-            setTypeface(null, Typeface.BOLD); layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
-        })
+        head.addView(TextView(this).apply { text = title; setTextColor(c("#ffffff")); textSize = 16f; setTypeface(null, Typeface.BOLD); layoutParams = LinearLayout.LayoutParams(0, -2, 1f) })
         head.addView(TextView(this).apply {
             text = "✖"; setTextColor(c("#ffffff")); textSize = 13f
             setPadding(dp(12), dp(5), dp(12), dp(5)); background = grad("#1e6eff", "#0a32be", 14)
-            setOnClickListener { d.dismiss() }
+            setOnClickListener { onClose() }
         })
         root.addView(head)
-        val fields = HashMap<String, EditText>()
-        fun field(k: String, label: String, hint: String, multi: Boolean = false): FrameLayout {
-            val fr = FrameLayout(this)
-            val e = EditText(this).apply {
-                this.hint = hint; setHintTextColor(c("#a3adc2")); setTextColor(c("#1f2a44")); textSize = 14f
-                setText(if (newMode) (if (k == "name" || k == "local" || k == "cloud" || k == "user" || k == "pass") "" else defs[k] ?: "") else (prefs.getString(k, null) ?: defs[k] ?: ""))
-                if (k == "pass") { inputType = 129; if (!newMode && !prefs.getBoolean("remember", true)) setText("") }
-                if (multi) { isSingleLine = false; minLines = 3; maxLines = 4; gravity = Gravity.TOP or Gravity.START } else isSingleLine = true
-                setPadding(dp(12), dp(10), dp(12), dp(8)); background = box("#ffffff", "#9fb3d9", 14)
-            }
-            fields[k] = e
-            fr.addView(e, FrameLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-            fr.addView(TextView(this).apply {
-                text = label; textSize = 11f; setTextColor(c("#1e6eff")); setBackgroundColor(c("#EEF3FB")); setPadding(dp(4), 0, dp(4), 0)
-            }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { marginStart = dp(12) })
-            return fr
-        }
-        fun row(vararg cols: FrameLayout) {
-            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            cols.forEachIndexed { i, cl -> r.addView(cl, LinearLayout.LayoutParams(0, -2, 1f).apply { if (i > 0) leftMargin = dp(8) }) }
-            root.addView(r, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-        }
-        row(field("name", "🏷️ اسم الشبكة", "شبكة النور"), field("wan", "واجهة الإنترنت", "ether1"))
-        row(field("local", "عنوان الراوتر (محلي)", "192.168.88.1"), field("cloud", "عنوان الكلاود (خارجي)", "xxxx.sn.mynetname.net"))
-        row(field("user", "اسم المستخدم", ""), field("pass", "كلمة المرور", ""), field("port", "منفذ API", "8728"))
-        row(field("modems", "المودمات: سطر لكل مودم (IP ثم الاسم)", "90.90.2.2 شيبان", true))
-        val cbRemember = CheckBox(this).apply { text = "🔐 تذكّر بيانات الدخول"; textSize = 13f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("remember", true) }
-        val cbErr = CheckBox(this).apply { text = "🔴 إشعار فوري عند أي خطأ أحمر في السجل"; textSize = 13f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("notif_err", true) }
-        val cbWarn = CheckBox(this).apply { text = "🟡 إشعار للتحذيرات الصفراء أيضاً"; textSize = 13f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("notif_warn", false) }
-        val checks = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setPadding(dp(10), dp(4), dp(10), dp(4)); background = grad("#ffffff", "#e8f0ff", 16)
-            addView(cbRemember); addView(cbErr); addView(cbWarn)
-        }
-        root.addView(checks, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        return root to root
+    }
+
+    private fun addRow(root: LinearLayout, vararg cols: View, weights: FloatArray? = null) {
+        val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        cols.forEachIndexed { i, cl -> r.addView(cl, LinearLayout.LayoutParams(0, -2, weights?.get(i) ?: 1f).apply { if (i > 0) leftMargin = dp(8) }) }
+        root.addView(r, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+    }
+
+    private fun saveButtons(root: LinearLayout, d: android.app.Dialog, label: String, onSave: () -> Unit) {
         val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         btns.addView(TextView(this).apply {
-            text = "حفظ واتصال"; setTextColor(c("#ffffff")); textSize = 15f; gravity = Gravity.CENTER; setTypeface(null, Typeface.BOLD)
+            text = label; setTextColor(c("#ffffff")); textSize = 15f; gravity = Gravity.CENTER; setTypeface(null, Typeface.BOLD)
             setPadding(0, dp(12), 0, dp(12)); background = grad("#18be82", "#109664", 16)
-            setOnClickListener {
-                val e = prefs.edit()
-                for ((k, v) in fields) e.putString(k, v.text.toString().trim())
-                e.putBoolean("remember", cbRemember.isChecked).putBoolean("notif_err", cbErr.isChecked).putBoolean("notif_warn", cbWarn.isChecked)
-                e.apply()
-                val id = if (newMode) Routers.newId() else Routers.activeId(this@MainActivity).ifBlank { Routers.newId() }
-                Routers.upsert(this@MainActivity, Routers.fromCfg(this@MainActivity, id, cbRemember.isChecked))
-                Routers.setActive(this@MainActivity, id)
-                applyConfigChange()
-                askBatteryExemption(false)
-                d.dismiss()
-            }
+            setOnClickListener { onSave() }
         }, LinearLayout.LayoutParams(0, -2, 2f))
         btns.addView(TextView(this).apply {
             text = "إلغاء"; setTextColor(c("#1f2a44")); textSize = 15f; gravity = Gravity.CENTER
             setPadding(0, dp(12), 0, dp(12)); background = grad("#ffffff", "#dbe6fb", 16)
             setOnClickListener { d.dismiss() }
         }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(8) })
-        root.addView(btns, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
-        d.setContentView(root)
-        d.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        root.addView(btns, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+    }
+
+    // صفحة تسجيل الدخول: راوتر جديد (editId = null) أو تعديل بيانات راوتر محفوظ. بدون مودمات ولا تنبيهات.
+    private fun loginPage(editId: String?) {
+        val old = if (editId != null) Routers.load(this).firstOrNull { it.id == editId } else null
+        lateinit var d: android.app.Dialog
+        val (root, _) = pageShell(if (old == null) "➕ إضافة راوتر" else "✏️ تعديل الراوتر") { d.dismiss() }
+        fun ed(v: String, hint: String, pwd: Boolean = false) = EditText(this).apply { setText(v); this.hint = hint; isSingleLine = true; if (pwd) inputType = 129 }
+        val eName = ed(old?.name ?: "", "شبكة النور")
+        val eLocal = ed(old?.local ?: "", "192.168.88.1")
+        val eCloud = ed(old?.cloud ?: "", "xxxx.sn.mynetname.net")
+        val eUser = ed(old?.user ?: "", "admin")
+        val ePass = ed(old?.pass ?: "", "", true)
+        val ePort = ed(old?.port ?: "8728", "8728")
+        addRow(root, lbl("🏷️ اسم الراوتر", eName))
+        addRow(root, lbl("عنوان الراوتر (IP أو DNS)", eLocal))
+        addRow(root, lbl("عنوان الكلاود (اختياري)", eCloud))
+        addRow(root, lbl("اسم المستخدم", eUser), lbl("منفذ API", ePort), weights = floatArrayOf(2f, 1f))
+        addRow(root, lbl("كلمة المرور", ePass))
+        val cbRemember = CheckBox(this).apply { text = "🔐 حفظ بيانات الدخول"; textSize = 14f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("remember", true) }
+        root.addView(LinearLayout(this).apply {
+            setPadding(dp(10), dp(4), dp(10), dp(4)); background = grad("#ffffff", "#e8f0ff", 16); addView(cbRemember)
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        d = fullDialog(root)
+        saveButtons(root, d, "حفظ") {
+            val local = eLocal.text.toString().trim(); val cloud = eCloud.text.toString().trim()
+            if (local.isEmpty() && cloud.isEmpty() || eUser.text.isNullOrBlank()) {
+                Toast.makeText(this, "أدخل العنوان واسم المستخدم", Toast.LENGTH_LONG).show(); return@saveButtons
+            }
+            val keep = cbRemember.isChecked
+            prefs.edit().putBoolean("remember", keep).apply()
+            val r = RouterCfg(old?.id ?: Routers.newId(), eName.text.toString().trim(), local, cloud,
+                ePort.text.toString().trim().ifEmpty { "8728" }, eUser.text.toString().trim(),
+                if (keep) ePass.text.toString() else "", old?.wan ?: "ether1", old?.modems ?: "", old?.nErr ?: true, old?.nWarn ?: false)
+            // لو ما حفظنا كلمة المرور، نبقيها بالذاكرة للراوتر الحالي حتى يتصل
+            Routers.upsert(this, r)
+            d.dismiss()
+            if (old == null) {
+                // راوتر جديد: ندخل عليه مباشرة بكلمة المرور المكتوبة
+                val live = RouterCfg(r.id, r.name, r.local, r.cloud, r.port, r.user, ePass.text.toString(), r.wan, r.modems, r.nErr, r.nWarn)
+                Routers.setActive(this, r.id); Routers.applyToCfg(this, live); applyConfigChange()
+                routersDlg?.dismiss(); routersDlg = null
+                askBatteryExemption(false)
+            } else {
+                if (r.id == Routers.activeId(this)) { Routers.applyToCfg(this, RouterCfg(r.id, r.name, r.local, r.cloud, r.port, r.user, ePass.text.toString(), r.wan, r.modems, r.nErr, r.nWarn)); applyConfigChange() }
+                refreshRoutersScreen()
+            }
+        }
+        d.show()
+    }
+
+    // إعدادات الراوتر الحالي داخل اللوحة: المودمات + واجهة الإنترنت + التنبيهات
+    private fun settings() {
+        Routers.ensure(this)
+        lateinit var d: android.app.Dialog
+        val (root, _) = pageShell("⚙️ إعدادات ${netName(prefs)}") { d.dismiss() }
+        val eWan = EditText(this).apply { setText(prefs.getString("wan", "ether1") ?: "ether1"); hint = "ether1"; isSingleLine = true }
+        val eModems = EditText(this).apply {
+            setText(prefs.getString("modems", "") ?: ""); hint = "90.90.2.2 شيبان"
+            isSingleLine = false; minLines = 6; maxLines = 8; gravity = Gravity.TOP or Gravity.START
+        }
+        addRow(root, lbl("واجهة الإنترنت (WAN)", eWan))
+        addRow(root, lbl("المودمات: سطر لكل مودم (IP ثم الاسم)", eModems))
+        val cbErr = CheckBox(this).apply { text = "🔴 إشعار فوري عند أي خطأ أحمر في السجل"; textSize = 13f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("notif_err", true) }
+        val cbWarn = CheckBox(this).apply { text = "🟡 إشعار للتحذيرات الصفراء أيضاً"; textSize = 13f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("notif_warn", false) }
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(10), dp(4), dp(10), dp(4)); background = grad("#ffffff", "#e8f0ff", 16)
+            addView(cbErr); addView(cbWarn)
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        d = fullDialog(root)
+        saveButtons(root, d, "حفظ") {
+            prefs.edit().putString("wan", eWan.text.toString().trim().ifEmpty { "ether1" }).putString("modems", eModems.text.toString().trim())
+                .putBoolean("notif_err", cbErr.isChecked).putBoolean("notif_warn", cbWarn.isChecked).apply()
+            val id = Routers.activeId(this)
+            if (id.isNotEmpty()) {
+                val keepPass = prefs.getBoolean("remember", true)
+                val cur = Routers.load(this).firstOrNull { it.id == id }
+                val upd = Routers.fromCfg(this, id, true)
+                if (cur != null && !keepPass) upd.pass = cur.pass else if (!keepPass) upd.pass = ""
+                Routers.upsert(this, upd)
+            }
+            Shared.cfgGen++; Shared.forceModem = true; Shared.modemsReady = false; Shared.modems = emptyList(); lastModems = null
+            startMonitor()
+            d.dismiss()
+        }
         d.show()
     }
 
