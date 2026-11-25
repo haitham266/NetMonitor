@@ -1826,6 +1826,32 @@ class MainActivity : Activity() {
             .show()
     }
 
+    private var settingsFields: List<Pair<String, EditText>> = emptyList()
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) return
+        try {
+            if (requestCode == 7101) {
+                val o = org.json.JSONObject()
+                settingsFields.forEach { (k, ed) -> o.put(k, ed.text.toString().trim()) }
+                o.put("app", "net-microtik-monitor"); o.put("v", 1)
+                contentResolver.openOutputStream(uri, "wt")!!.use { it.write(o.toString(2).toByteArray(Charsets.UTF_8)) }
+                Toast.makeText(this, "تم حفظ ملف الإعدادات", Toast.LENGTH_LONG).show()
+            } else if (requestCode == 7102) {
+                val txt = contentResolver.openInputStream(uri)!!.use { String(it.readBytes(), Charsets.UTF_8) }
+                val o = org.json.JSONObject(txt)
+                if (o.optString("app") != "net-microtik-monitor") throw Exception("bad")
+                var n = 0
+                settingsFields.forEach { (k, ed) -> if (o.has(k)) { ed.setText(o.getString(k)); n++ } }
+                Toast.makeText(this, "تم استيراد الإعدادات، اضغط حفظ واتصال", Toast.LENGTH_LONG).show()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "فشلت العملية: ملف غير صالح أو لا توجد صلاحية", Toast.LENGTH_LONG).show()
+        }
+    }
+
     private fun settings() {
         val defs = mapOf("port" to "8728", "wan" to "ether1", "modems" to DEFAULT_MODEMS)
         val keys = listOf(
@@ -1846,6 +1872,7 @@ class MainActivity : Activity() {
             EditText(this).apply {
                 hint = h
                 setText(prefs.getString(k, null) ?: defs[k] ?: "")
+                if (k == "pass" && !prefs.getBoolean("remember", true)) setText("")
                 if (k == "pass") inputType = 129
                 if (k == "modems") { isSingleLine = false; minLines = 4; gravity = Gravity.TOP or Gravity.START } else isSingleLine = true
                 l.addView(this)
@@ -1858,10 +1885,39 @@ class MainActivity : Activity() {
         val cbErr = CheckBox(this).apply { text = "🔴 إشعار فوري عند أي خطأ أحمر (موصى به)"; isChecked = prefs.getBoolean("notif_err", true); l.addView(this) }
         val cbWarn = CheckBox(this).apply { text = "🟡 إشعار للتحذيرات الصفراء أيضاً"; isChecked = prefs.getBoolean("notif_warn", false); l.addView(this) }
 
+        val cbRemember = CheckBox(this).apply { text = "🔐 تذكّر بيانات الدخول (اسم المستخدم وكلمة المرور)"; isChecked = prefs.getBoolean("remember", true); l.addView(this) }
+        settingsFields = keys.map { it.first }.zip(es)
+        l.addView(TextView(this).apply {
+            text = "💾 نسخة احتياطية للإعدادات"; textSize = 13f; setTextColor(c("#8b949e"))
+            setTypeface(null, Typeface.BOLD); setPadding(0, dp(16), 0, dp(2))
+        })
+        l.addView(Button(this).apply {
+            text = "📤 تصدير الإعدادات إلى ملف"
+            setOnClickListener {
+                val it2 = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE); type = "application/json"
+                    putExtra(Intent.EXTRA_TITLE, "net-microtik-monitor-settings.json")
+                }
+                try { startActivityForResult(it2, 7101) } catch (e: Exception) { Toast.makeText(this@MainActivity, "تعذر فتح اختيار الملف", Toast.LENGTH_LONG).show() }
+            }
+        })
+        l.addView(Button(this).apply {
+            text = "📥 استيراد الإعدادات من ملف"
+            setOnClickListener {
+                val it2 = Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }
+                try { startActivityForResult(it2, 7102) } catch (e: Exception) { Toast.makeText(this@MainActivity, "تعذر فتح اختيار الملف", Toast.LENGTH_LONG).show() }
+            }
+        })
+        l.addView(TextView(this).apply {
+            text = "تنبيه: ملف التصدير يحتوي كلمة مرور الراوتر بشكل نصي، احفظه في مكان آمن ولا ترسله لأحد."
+            textSize = 11f; setTextColor(c("#d29922")); setPadding(0, dp(4), 0, 0)
+        })
+
         AlertDialog.Builder(this).setTitle("⚙️ إعدادات الشبكة والمراقبة").setView(ScrollView(this).apply { addView(l) })
             .setPositiveButton("حفظ واتصال") { _, _ ->
                 val e = prefs.edit()
                 keys.forEachIndexed { i, p -> e.putString(p.first, es[i].text.toString().trim()) }
+                e.putBoolean("remember", cbRemember.isChecked)
                 e.putBoolean("notif_err", cbErr.isChecked).putBoolean("notif_warn", cbWarn.isChecked)
                 e.apply()
                 tvTitle.text = "📡 ${netName(prefs)}"
