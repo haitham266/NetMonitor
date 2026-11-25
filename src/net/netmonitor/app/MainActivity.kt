@@ -337,6 +337,93 @@ fun rosConnect(prefs: SharedPreferences): Ros {
     throw last
 }
 
+class RouterCfg(
+    val id: String, var name: String, var local: String, var cloud: String, var port: String,
+    var user: String, var pass: String, var wan: String, var modems: String
+) {
+    fun sig() = listOf(local, cloud, port, user, pass).joinToString("|")
+    fun title() = name.ifBlank { local.ifBlank { cloud.ifBlank { "راوتر" } } }
+    fun address() = local.ifBlank { cloud }
+}
+
+object Routers {
+    private fun sp(ctx: Context) = ctx.getSharedPreferences("routers", Context.MODE_PRIVATE)
+    private fun cfg(ctx: Context) = ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+
+    fun load(ctx: Context): MutableList<RouterCfg> {
+        val out = ArrayList<RouterCfg>()
+        try {
+            val a = org.json.JSONArray(sp(ctx).getString("list", "[]"))
+            for (i in 0 until a.length()) {
+                val o = a.getJSONObject(i)
+                out.add(RouterCfg(o.getString("id"), o.optString("name"), o.optString("local"), o.optString("cloud"),
+                    o.optString("port", "8728"), o.optString("user"), o.optString("pass"), o.optString("wan", "ether1"), o.optString("modems")))
+            }
+        } catch (e: Exception) { }
+        return out
+    }
+
+    fun save(ctx: Context, list: List<RouterCfg>) {
+        val a = org.json.JSONArray()
+        for (r in list) a.put(org.json.JSONObject().put("id", r.id).put("name", r.name).put("local", r.local).put("cloud", r.cloud)
+            .put("port", r.port).put("user", r.user).put("pass", r.pass).put("wan", r.wan).put("modems", r.modems))
+        sp(ctx).edit().putString("list", a.toString()).apply()
+    }
+
+    fun activeId(ctx: Context): String = sp(ctx).getString("active", "") ?: ""
+    fun setActive(ctx: Context, id: String) { sp(ctx).edit().putString("active", id).apply() }
+    fun newId(): String = "r" + java.lang.Long.toString(System.currentTimeMillis(), 36) + (Math.random() * 1000).toInt()
+
+    fun fromCfg(ctx: Context, id: String, keepPass: Boolean = true): RouterCfg {
+        val p = cfg(ctx)
+        fun g(k: String, d: String = "") = p.getString(k, d) ?: d
+        return RouterCfg(id, g("name"), g("local"), g("cloud"), g("port", "8728"), g("user"), if (keepPass) g("pass") else "", g("wan", "ether1"), g("modems"))
+    }
+
+    // الإعدادات القديمة (راوتر واحد) تصير أول راوتر محفوظ
+    fun ensure(ctx: Context) {
+        val list = load(ctx)
+        if (list.isEmpty()) {
+            if (cfg(ctx).contains("user")) {
+                val r = fromCfg(ctx, newId())
+                save(ctx, listOf(r)); setActive(ctx, r.id)
+            }
+            return
+        }
+        if (list.none { it.id == activeId(ctx) }) setActive(ctx, list[0].id)
+    }
+
+    fun upsert(ctx: Context, r: RouterCfg) {
+        val list = load(ctx)
+        val i = list.indexOfFirst { it.id == r.id }
+        if (i >= 0) list[i] = r else list.add(r)
+        save(ctx, list)
+    }
+
+    fun remove(ctx: Context, id: String) { save(ctx, load(ctx).filter { it.id != id }) }
+
+    fun applyToCfg(ctx: Context, r: RouterCfg) {
+        cfg(ctx).edit().putString("name", r.name).putString("local", r.local).putString("cloud", r.cloud).putString("port", r.port)
+            .putString("user", r.user).putString("pass", r.pass).putString("wan", r.wan).putString("modems", r.modems).apply()
+    }
+}
+
+// اتصال بحقول راوتر محدد (للمراقبة بالخلفية للراوترات الأخرى)
+fun rosConnectTo(r: RouterCfg): Ros {
+    val port = r.port.toIntOrNull() ?: 8728
+    var last: Exception = IOException("أدخل عنوان الراوتر")
+    for ((h, t) in listOf(r.local to 2500, r.cloud to 8000)) {
+        if (h.isBlank()) continue
+        var c: Ros? = null
+        try {
+            c = Ros(h, port, t)
+            c.login(r.user, r.pass)
+            return c
+        } catch (e: Exception) { c?.close(); last = e }
+    }
+    throw last
+}
+
 fun startMonitorService(ctx: Context) {
     ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE).edit().putBoolean("enabled", true).apply()
     val i = Intent(ctx, MonitorService::class.java)
@@ -393,6 +480,7 @@ class MonitorService : Service() {
             prefs.edit().putBoolean("enabled", false).apply()
             running = false
             Net.reset()
+            stopWatches()
             try {
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 nm.cancelAll()
@@ -424,6 +512,7 @@ class MonitorService : Service() {
             Thread { mainLoop() }.apply { isDaemon = true; start() }
             Thread { modemLoop() }.apply { isDaemon = true; start() }
             Thread { logLoop() }.apply { isDaemon = true; start() }
+            Thread { watchSync() }.apply { isDaemon = true; start() }
         }
         return START_STICKY
     }
@@ -437,6 +526,7 @@ class MonitorService : Service() {
     override fun onDestroy() {
         running = false
         Net.reset()
+        stopWatches()
         try { stopForeground(true) } catch (e: Exception) { }
         try { wl?.release() } catch (e: Exception) { }
         try { wifiLock?.release() } catch (e: Exception) { }
@@ -698,6 +788,110 @@ class MonitorService : Service() {
         }
     }
 
+    // ---------- مراقبة بقية الراوترات بالخلفية: اتصال واحد لكل راوتر (سجل + انقطاع) ----------
+    private class Watch(val cfg: RouterCfg) { @Volatile var stop = false; @Volatile var ros: Ros? = null }
+    private val watches = HashMap<String, Watch>()
+
+    private fun watchSync() {
+        while (running) {
+            try {
+                val list = Routers.load(this)
+                val act = Routers.activeId(this)
+                val want = list.filter { it.id != act && it.user.isNotBlank() && (it.local.isNotBlank() || it.cloud.isNotBlank()) }
+                synchronized(watches) {
+                    val it = watches.entries.iterator()
+                    while (it.hasNext()) {
+                        val (id, w) = it.next()
+                        val cur = want.firstOrNull { x -> x.id == id }
+                        if (cur == null || cur.sig() != w.cfg.sig() || cur.name != w.cfg.name) {
+                            w.stop = true; try { w.ros?.close() } catch (e: Exception) { }; it.remove()
+                        }
+                    }
+                    for (r in want) if (!watches.containsKey(r.id)) {
+                        val w = Watch(r); watches[r.id] = w
+                        Thread { watchLoop(w) }.apply { isDaemon = true; start() }
+                    }
+                }
+            } catch (e: Exception) { }
+            nap(3000)
+        }
+        stopWatches()
+    }
+
+    private fun stopWatches() {
+        synchronized(watches) {
+            for (w in watches.values) { w.stop = true; try { w.ros?.close() } catch (e: Exception) { } }
+            watches.clear()
+        }
+    }
+
+    private fun watchNotify(w: Watch, title: String, text: String) {
+        try {
+            val open = PendingIntent.getActivity(this, 7, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            val n = builder(CH_ALERT)
+                .setSmallIcon(android.R.drawable.stat_sys_warning)
+                .setContentTitle(title)
+                .setContentText(text.lineSequence().firstOrNull() ?: text)
+                .setSubText(w.cfg.title())
+                .setStyle(Notification.BigTextStyle().bigText(text))
+                .setContentIntent(open)
+                .setAutoCancel(true)
+                .build()
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(3000 + (w.cfg.id.hashCode() and 0xff) * 4 + (alertCnt++ % 4), n)
+        } catch (e: Exception) { }
+    }
+
+    private fun watchLoop(w: Watch) {
+        var fails = 0
+        var downAlerted = false
+        var lastId = -1L
+        while (running && !w.stop) {
+            var r: Ros? = null
+            try {
+                r = rosConnectTo(w.cfg)
+                w.ros = r
+                if (downAlerted) { watchNotify(w, "✅ عاد الاتصال بالراوتر", w.cfg.title()); downAlerted = false }
+                fails = 0
+                val init = r.cmd("/log/print", "=.proplist=.id,time,topics,message").mapNotNull { toLogEntry(it) }
+                if (init.isNotEmpty()) lastId = maxOf(lastId, init.last().id)
+                val pend = ArrayList<LogEntry>()
+                var lastFlush = 0L
+                fun flush(force: Boolean) {
+                    val now = System.currentTimeMillis()
+                    if (pend.isNotEmpty() && (force || now - lastFlush > 5000)) {
+                        val reds = pend.count { it.level == 2 }
+                        val title = if (reds > 0) "🔴 ${w.cfg.title()}: خطأ في السجل" else "🟡 ${w.cfg.title()}: تحذير في السجل"
+                        watchNotify(w, title, pend.takeLast(6).joinToString("\n") { "${it.time}  ${it.msg}" })
+                        pend.clear(); lastFlush = now
+                    }
+                }
+                r.streamImpl(
+                    arrayOf("/log/print", "=follow-only=", "=.proplist=.id,time,topics,message"),
+                    stop = { !running || w.stop },
+                    onIdle = { flush(false) },
+                    onRe = { m ->
+                        toLogEntry(m)?.let { e ->
+                            if (e.id > lastId) {
+                                lastId = e.id
+                                val wantErr = prefs.getBoolean("notif_err", true)
+                                val wantWarn = prefs.getBoolean("notif_warn", false)
+                                if ((e.level == 2 && wantErr) || (e.level == 1 && wantWarn)) pend.add(e)
+                            }
+                        }
+                        flush(false)
+                    }
+                )
+            } catch (e: Exception) {
+                try { r?.close() } catch (x: Exception) { }
+                w.ros = null
+                fails++
+                if (fails >= 3 && !downAlerted && !w.stop) { downAlerted = true; watchNotify(w, "🔌 الراوتر لا يستجيب", w.cfg.title()) }
+            }
+            nap(if (fails > 0) 10000L else 3000L)
+        }
+        try { w.ros?.close() } catch (e: Exception) { }
+    }
+
     // ---------- حلقة المودمات: فحص متوازي بعدة اتصالات (كل ~3 ثواني) ----------
     private fun modemLoop() {
         var myGen = Shared.cfgGen
@@ -925,6 +1119,7 @@ class MainActivity : Activity() {
             try { requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1) } catch (e: Exception) { }
         }
 
+        Routers.ensure(this)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(12), dp(12), dp(28))
@@ -961,8 +1156,12 @@ class MainActivity : Activity() {
             startMonitor()
         })
         header.addView(actionBtn("🔋") { askBatteryExemption(true) })
+        header.addView(actionBtn("🔀") { routersSheet() })
         header.addView(actionBtn("⚙️") { settings() })
-        header.addView(actionBtn("⏻") { confirmExit() })
+        header.addView(actionBtn("✖ خروج") { confirmExit() }.apply {
+            setTextColor(c("#ffffff")); setTypeface(null, Typeface.BOLD); textSize = 13f
+            background = grad("#ff6a5c", "#d6362a", 14)
+        })
         root.addView(header)
 
         banner = TextView(this).apply {
@@ -1826,7 +2025,107 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun settings() {
+    // تطبيق تغيير الراوتر النشط: تصفير الجلسة والحالة وإعادة الاتصال (جلسة واحدة جديدة)
+    private fun applyConfigChange() {
+        tvTitle.text = "📡 ${netName(prefs)}"
+        Net.reset()
+        Shared.cfgGen++
+        Shared.forceModem = true
+        Shared.modemsReady = false
+        Shared.error = null
+        Shared.snap = null
+        Shared.modems = emptyList()
+        lastSnap = null; lastModems = null
+        startMonitor()
+    }
+
+    private fun switchRouter(r: RouterCfg) {
+        Routers.applyToCfg(this, r)
+        Routers.setActive(this, r.id)
+        applyConfigChange()
+    }
+
+    // قائمة الراوترات المحفوظة (ورقة من الأسفل)
+    private fun routersSheet() {
+        Routers.ensure(this)
+        val d = android.app.Dialog(this, android.R.style.Theme_DeviceDefault_Light_Dialog)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = grad("#ffffff", "#e8f0ff", 26)
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        root.addView(TextView(this).apply { text = "🔀 راوتراتي المحفوظة"; setTextColor(c("#1f2a44")); textSize = 17f; setTypeface(null, Typeface.BOLD) })
+        val list = Routers.load(this)
+        val act = Routers.activeId(this)
+        if (list.isEmpty()) note(root, "لا توجد راوترات محفوظة بعد")
+        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        for (r in list) {
+            val isAct = r.id == act
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = if (isAct) grad("#18be82", "#109664", 16) else grad("#ffffff", "#dbe6fb", 16)
+                isClickable = true
+                setOnClickListener { d.dismiss(); if (!isAct) switchRouter(r) }
+            }
+            val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; layoutParams = LinearLayout.LayoutParams(0, -2, 1f) }
+            info.addView(TextView(this).apply {
+                text = (if (isAct) "✅ " else "📡 ") + r.title(); textSize = 15f; setTypeface(null, Typeface.BOLD)
+                setTextColor(c(if (isAct) "#ffffff" else "#1f2a44"))
+            })
+            info.addView(TextView(this).apply {
+                text = "${r.address()} • ${r.user}:${r.port}"; textSize = 12f
+                setTextColor(c(if (isAct) "#e6f6ee" else "#64708a")); textDirection = View.TEXT_DIRECTION_LTR
+            })
+            row.addView(info)
+            row.addView(TextView(this).apply {
+                text = if (isAct) "الحالي" else "↩ دخول"; textSize = 12f; setTextColor(c("#ffffff"))
+                setPadding(dp(10), dp(5), dp(10), dp(5)); background = grad(if (isAct) "#0e7a52" else "#1e6eff", if (isAct) "#0b5e40" else "#0a32be", 12)
+            })
+            row.addView(TextView(this).apply {
+                text = "🗑"; textSize = 16f; setPadding(dp(10), dp(5), dp(6), dp(5))
+                setOnClickListener { confirmDeleteRouter(r, d) }
+            })
+            listBox.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        }
+        root.addView(ScrollView(this).apply { addView(listBox) }, LinearLayout.LayoutParams(-1, -2))
+        root.addView(TextView(this).apply {
+            text = "➕ إضافة راوتر"; textSize = 15f; gravity = Gravity.CENTER; setTypeface(null, Typeface.BOLD); setTextColor(c("#ffffff"))
+            setPadding(0, dp(12), 0, dp(12)); background = grad("#1e6eff", "#0a32be", 16)
+            setOnClickListener { d.dismiss(); settings(true) }
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        d.setContentView(root)
+        d.window?.apply {
+            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+            setGravity(Gravity.BOTTOM)
+            setLayout(android.view.WindowManager.LayoutParams.MATCH_PARENT, android.view.WindowManager.LayoutParams.WRAP_CONTENT)
+        }
+        d.show()
+    }
+
+    private fun confirmDeleteRouter(r: RouterCfg, sheet: android.app.Dialog) {
+        AlertDialog.Builder(this, R.style.NMDialog)
+            .setTitle("حذف الراوتر")
+            .setMessage("حذف \"${r.title()}\" من القائمة المحفوظة؟")
+            .setPositiveButton("حذف") { _, _ ->
+                val wasActive = r.id == Routers.activeId(this)
+                Routers.remove(this, r.id)
+                sheet.dismiss()
+                val rest = Routers.load(this)
+                if (wasActive) {
+                    if (rest.isNotEmpty()) switchRouter(rest[0])
+                    else {
+                        prefs.edit().remove("user").remove("pass").remove("local").remove("cloud").apply()
+                        applyConfigChange(); settings(true)
+                    }
+                }
+            }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
+    private fun settings(newMode: Boolean = false) {
         val defs = mapOf("port" to "8728", "wan" to "ether1", "modems" to DEFAULT_MODEMS)
         val d = android.app.Dialog(this, android.R.style.Theme_DeviceDefault_Light_NoActionBar)
         val root = LinearLayout(this).apply {
@@ -1840,7 +2139,7 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(8), dp(10), dp(8)); background = grad(NAV1, NAV2, 22)
         }
         head.addView(TextView(this).apply {
-            text = "⚙️ إعدادات الشبكة والمراقبة"; setTextColor(c("#ffffff")); textSize = 16f
+            text = if (newMode) "➕ إضافة راوتر" else "⚙️ إعدادات الشبكة والمراقبة"; setTextColor(c("#ffffff")); textSize = 16f
             setTypeface(null, Typeface.BOLD); layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         })
         head.addView(TextView(this).apply {
@@ -1854,8 +2153,8 @@ class MainActivity : Activity() {
             val fr = FrameLayout(this)
             val e = EditText(this).apply {
                 this.hint = hint; setHintTextColor(c("#a3adc2")); setTextColor(c("#1f2a44")); textSize = 14f
-                setText(prefs.getString(k, null) ?: defs[k] ?: "")
-                if (k == "pass") { inputType = 129; if (!prefs.getBoolean("remember", true)) setText("") }
+                setText(if (newMode) (if (k == "name" || k == "local" || k == "cloud" || k == "user" || k == "pass") "" else defs[k] ?: "") else (prefs.getString(k, null) ?: defs[k] ?: ""))
+                if (k == "pass") { inputType = 129; if (!newMode && !prefs.getBoolean("remember", true)) setText("") }
                 if (multi) { isSingleLine = false; minLines = 3; maxLines = 4; gravity = Gravity.TOP or Gravity.START } else isSingleLine = true
                 setPadding(dp(12), dp(10), dp(12), dp(8)); background = box("#ffffff", "#9fb3d9", 14)
             }
@@ -1892,15 +2191,10 @@ class MainActivity : Activity() {
                 for ((k, v) in fields) e.putString(k, v.text.toString().trim())
                 e.putBoolean("remember", cbRemember.isChecked).putBoolean("notif_err", cbErr.isChecked).putBoolean("notif_warn", cbWarn.isChecked)
                 e.apply()
-                tvTitle.text = "📡 ${netName(prefs)}"
-                Shared.cfgGen++
-                Shared.forceModem = true
-                Shared.modemsReady = false
-                Shared.error = null
-                Shared.snap = null
-                Shared.modems = emptyList()
-                lastSnap = null; lastModems = null
-                startMonitor()
+                val id = if (newMode) Routers.newId() else Routers.activeId(this@MainActivity).ifBlank { Routers.newId() }
+                Routers.upsert(this@MainActivity, Routers.fromCfg(this@MainActivity, id, cbRemember.isChecked))
+                Routers.setActive(this@MainActivity, id)
+                applyConfigChange()
                 askBatteryExemption(false)
                 d.dismiss()
             }
