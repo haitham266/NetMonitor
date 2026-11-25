@@ -57,14 +57,82 @@ def load_cfg():
         return dict(_cfg)
 
 
-def save_cfg(c):
+def save_cfg(c, persist_pass=True):
     global _cfg
     with _cfg_lock:
         os.makedirs(CFG_DIR, exist_ok=True)
         clean = {k: str(c.get(k, DEFAULTS[k])).strip() for k in DEFAULTS}
+        disk = dict(clean)
+        if not persist_pass:
+            disk["pass"] = ""
         with open(CFG_FILE, "w", encoding="utf-8") as f:
-            json.dump(clean, f, ensure_ascii=False, indent=2)
+            json.dump(disk, f, ensure_ascii=False, indent=2)
         _cfg = clean
+
+
+# ======================= الراوترات المحفوظة (مثل نسخة الأندرويد) =======================
+ROUTERS_FILE = os.path.join(CFG_DIR, "routers.json")
+R_KEYS = ("name", "local", "cloud", "port", "user", "pass", "wan", "modems", "notifErr", "notifWarn")
+_rt_lock = threading.RLock()
+_rt = None   # {"active": id, "list": [ {id, ...} ]}
+DEMO = False
+
+
+def _new_id():
+    return "r%x%03d" % (int(time.time()), int.from_bytes(os.urandom(2), "big") % 1000)
+
+
+def rt_load():
+    global _rt
+    with _rt_lock:
+        if _rt is None:
+            d = {"active": "", "list": []}
+            try:
+                with open(ROUTERS_FILE, "r", encoding="utf-8") as f:
+                    j = json.load(f)
+                d["active"] = str(j.get("active", ""))
+                for r in j.get("list", []):
+                    e = {k: str(r.get(k, DEFAULTS[k])) for k in R_KEYS}
+                    e["id"] = str(r.get("id") or _new_id())
+                    d["list"].append(e)
+            except Exception:
+                pass
+            if not d["list"]:   # الإعدادات القديمة (راوتر واحد) تصير أول راوتر
+                c = load_cfg()
+                if configured(c):
+                    e = {k: c[k] for k in R_KEYS}
+                    e["id"] = _new_id()
+                    d = {"active": e["id"], "list": [e]}
+            if d["list"] and not any(r["id"] == d["active"] for r in d["list"]):
+                d["active"] = d["list"][0]["id"]
+            _rt = d
+            if not DEMO:
+                rt_save()
+        return _rt
+
+
+def rt_save():
+    if DEMO:
+        return
+    with _rt_lock:
+        os.makedirs(CFG_DIR, exist_ok=True)
+        with open(ROUTERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_rt, f, ensure_ascii=False, indent=2)
+
+
+def rt_apply(r, live_pass=None, persist_pass=True):
+    """يجعل الراوتر r هو النشط: ينسخ بياناته للإعدادات الحالية ويعيد الاتصال بجلسة واحدة جديدة."""
+    c = {k: r.get(k, DEFAULTS[k]) for k in R_KEYS}
+    if live_pass is not None:
+        c["pass"] = live_pass
+    save_cfg(c, persist_pass=persist_pass)
+    _rt["active"] = r["id"]
+    rt_save()
+    with S_LOCK:
+        S["gen"] += 1
+        S["modemsReady"], S["error"], S["snap"], S["modems"] = False, None, None, []
+    Net.reset()
+    FORCE.set()
 
 
 def net_name(c=None):
@@ -419,12 +487,12 @@ def win_toast(title, text):
         pass
 
 
-def alert(title, text, toast=True):
+def alert(title, text, toast=True, who=None):
     with S_LOCK:
         S["evId"] += 1
         S["events"] = (S["events"] + [{"id": S["evId"], "title": title, "text": text, "ts": int(time.time() * 1000)}])[-30:]
     if toast:
-        win_toast(title + " — " + net_name(), text)
+        win_toast(title + " — " + (who or net_name()), text)
 
 
 # ======================= التشغيل مع ويندوز =======================
@@ -468,6 +536,100 @@ def set_autostart(on):
 
 
 # ======================= الحلقة الرئيسية (كل ثانيتين) =======================
+# ======================= مراقبة بقية الراوترات بالخلفية (اتصال واحد لكل راوتر) =======================
+_watches = {}
+
+
+def _sig(r):
+    return "|".join(r.get(k, "") for k in ("local", "cloud", "port", "user", "pass", "name", "notifErr", "notifWarn"))
+
+
+def watch_sync():
+    while not STOP.is_set():
+        try:
+            d = rt_load()
+            with _rt_lock:
+                want = {r["id"]: dict(r) for r in d["list"] if r["id"] != d["active"] and r.get("user") and (r.get("local") or r.get("cloud"))}
+            for rid in list(_watches):
+                w = _watches[rid]
+                if rid not in want or w["sig"] != _sig(want[rid]):
+                    w["stop"].set()
+                    try:
+                        if w["ros"]:
+                            w["ros"].close()
+                    except Exception:
+                        pass
+                    del _watches[rid]
+            for rid, r in want.items():
+                if rid not in _watches:
+                    w = {"sig": _sig(r), "stop": threading.Event(), "ros": None}
+                    _watches[rid] = w
+                    threading.Thread(target=watch_loop, args=(r, w), daemon=True).start()
+        except Exception:
+            pass
+        STOP.wait(3)
+    for w in list(_watches.values()):
+        w["stop"].set()
+        try:
+            if w["ros"]:
+                w["ros"].close()
+        except Exception:
+            pass
+
+
+def watch_loop(r, w):
+    name = r.get("name") or r.get("local") or r.get("cloud") or "راوتر"
+    cc = {k: r.get(k, DEFAULTS[k]) for k in R_KEYS}
+    fails, down, last_id = 0, False, -1
+    while not STOP.is_set() and not w["stop"].is_set():
+        ros = None
+        try:
+            ros = ros_connect(cc, set_via=False)
+            w["ros"] = ros
+            if down:
+                alert("✅ عاد الاتصال بالراوتر", name, who=name)
+                down = False
+            fails = 0
+            init = [to_log(m) for m in ros.cmd("/log/print", "=.proplist=.id,time,topics,message")]
+            init = [e for e in init if e]
+            if init:
+                last_id = max(last_id, init[-1]["id"])
+            pend, st = [], {"last": 0.0}
+
+            def flush(force=False):
+                now = time.time()
+                if pend and (force or now - st["last"] > 5):
+                    reds = sum(1 for e in pend if e["level"] == 2)
+                    title = ("🔴 " if reds else "🟡 ") + name + (": خطأ في السجل" if reds else ": تحذير في السجل")
+                    alert(title, "\n".join(e["time"] + "  " + e["msg"] for e in pend[-6:]), who=name)
+                    pend.clear()
+                    st["last"] = now
+
+            def on_re(m):
+                nonlocal last_id
+                e = to_log(m)
+                if e and e["id"] > last_id:
+                    last_id = e["id"]
+                    if (e["level"] == 2 and cc["notifErr"] == "1") or (e["level"] == 1 and cc["notifWarn"] == "1"):
+                        pend.append(e)
+                flush()
+
+            ros.stream(["/log/print", "=follow-only=", "=.proplist=.id,time,topics,message"],
+                       lambda: STOP.is_set() or w["stop"].is_set(), lambda: flush(), on_re)
+        except Exception:
+            try:
+                if ros:
+                    ros.close()
+            except Exception:
+                pass
+            w["ros"] = None
+            fails += 1
+            if fails >= 3 and not down and not w["stop"].is_set():
+                down = True
+                alert("🔌 الراوتر لا يستجيب", name, who=name)
+        STOP.wait(10 if fails else 3)
+
+
 def main_loop():
     ros, gen, prev_if, was_wan = None, S["gen"], {}, None
     while not STOP.is_set():
@@ -794,6 +956,65 @@ def do_action(body):
 
 
 # ======================= خادم الواجهة المحلي =======================
+def routers_op(b):
+    op = b.get("op")
+    d = rt_load()
+    if DEMO:
+        return {"ok": True}
+    with _rt_lock:
+        if op == "save":
+            rid = str(b.get("id") or "")
+            old = next((r for r in d["list"] if r["id"] == rid), None)
+            r = dict(old) if old else {k: DEFAULTS[k] for k in R_KEYS}
+            r["id"] = rid or _new_id()
+            for k in ("name", "local", "cloud", "port", "user"):
+                r[k] = str(b.get(k, r.get(k, ""))).strip()
+            r["port"] = r["port"] or "8728"
+            if not r["user"] or not (r["local"] or r["cloud"]):
+                return {"ok": False, "msg": "أدخل العنوان واسم المستخدم"}
+            live = str(b.get("pass", ""))
+            keep = bool(b.get("remember", True))
+            r["pass"] = live if keep else ""
+            if old:
+                d["list"][d["list"].index(old)] = r
+            else:
+                d["list"].append(r)
+            rt_save()
+            if not old or r["id"] == d["active"]:
+                rt_apply(r, live_pass=live, persist_pass=keep)
+            return {"ok": True, "id": r["id"], "entered": (not old) or r["id"] == d["active"]}
+        if op == "enter":
+            r = next((x for x in d["list"] if x["id"] == b.get("id")), None)
+            if not r:
+                return {"ok": False}
+            if r["id"] != d["active"] or not configured(load_cfg()):
+                rt_apply(r)
+            else:
+                FORCE.set()
+            return {"ok": True}
+        if op == "delete":
+            rid = b.get("id")
+            was = d["active"] == rid
+            d["list"] = [x for x in d["list"] if x["id"] != rid]
+            if was:
+                if d["list"]:
+                    rt_save()
+                    rt_apply(d["list"][0])
+                else:
+                    d["active"] = ""
+                    c = load_cfg()
+                    for k in ("user", "pass", "local", "cloud"):
+                        c[k] = ""
+                    save_cfg(c)
+                    with S_LOCK:
+                        S["gen"] += 1
+                        S["snap"], S["modems"], S["modemsReady"], S["error"] = None, [], False, None
+                    Net.reset()
+            rt_save()
+            return {"ok": True}
+    return {"ok": False}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # بدون سجلات (البرنامج يعمل بدون نافذة أوامر)
         pass
@@ -822,7 +1043,12 @@ class Handler(BaseHTTPRequestHandler):
             c = load_cfg()
             st["configured"] = configured(c)
             st["name"] = net_name(c)
+            st["active"] = rt_load()["active"]
             return self._send(200, st)
+        if p == "/api/routers":
+            d = rt_load()
+            with _rt_lock:
+                return self._send(200, {"active": d["active"], "list": [dict(r) for r in d["list"]]})
         if p == "/api/settings":
             c = load_cfg()
             c["autostart"] = get_autostart()
@@ -840,8 +1066,22 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"ok": False, "msg": "طلب غير صالح"})
         p = urlparse(self.path).path
+        if p == "/api/routers":
+            return self._send(200, routers_op(body))
         if p == "/api/settings":
-            save_cfg(body)
+            # إعدادات الراوتر الحالي داخل اللوحة: واجهة الإنترنت + المودمات + التنبيهات (بدون بيانات الدخول)
+            c = load_cfg()
+            for k in ("wan", "modems", "notifErr", "notifWarn"):
+                if k in body:
+                    c[k] = str(body[k])
+            save_cfg(c)
+            d = rt_load()
+            with _rt_lock:
+                for r in d["list"]:
+                    if r["id"] == d["active"]:
+                        for k in ("wan", "modems", "notifErr", "notifWarn"):
+                            r[k] = c[k]
+            rt_save()
             try:
                 set_autostart(bool(body.get("autostart")))
             except Exception:
@@ -958,7 +1198,12 @@ def main():
             open_window()
         return
     if "--demo" in args:
-        global configured, net_name
+        global configured, net_name, DEMO, _rt
+        DEMO = True
+        _rt = {"active": "r1", "list": [
+            {"id": "r1", "name": "شبكة النور", "local": "192.168.88.1", "cloud": "", "port": "8728", "user": "admin", "pass": "x", "wan": "ether1", "modems": "90.90.2.2 شيبان\n90.90.3.3 اكرم\n90.90.2.4 الاستقبال\n90.90.2.5 الدور الأول", "notifErr": "1", "notifWarn": "0"},
+            {"id": "r2", "name": "هيثم كلاود", "local": "", "cloud": "b9070b4497c6.sn.mynetname.net", "port": "1177", "user": "haitham", "pass": "x", "wan": "ether1", "modems": "", "notifErr": "1", "notifWarn": "0"},
+            {"id": "r3", "name": "راوتر المكتب", "local": "10.99.99.1", "cloud": "", "port": "8728", "user": "admin", "pass": "x", "wan": "ether1", "modems": "", "notifErr": "1", "notifWarn": "1"}]}
         net_name = lambda c=None: "شبكة النور"  # noqa: E731
         configured = lambda c: True  # noqa: E731
         start_demo()
@@ -966,6 +1211,8 @@ def main():
         threading.Thread(target=main_loop, daemon=True).start()
         threading.Thread(target=modem_loop, daemon=True).start()
         threading.Thread(target=log_loop, daemon=True).start()
+        rt_load()
+        threading.Thread(target=watch_sync, daemon=True).start()
     if not background and "--no-window" not in args:
         threading.Timer(0.5, open_window).start()
     srv.serve_forever()
@@ -1099,6 +1346,52 @@ header h1{color:#0f1932}
 .ifr .bar{background:rgba(255,255,255,.25)}
 .ifr .bar>i{background:#fff!important}
 .mod:hover,.ifr:hover{filter:brightness(1.06)}
+
+/* ===== النوافذ والقوائم بنفس مظهر نسخة الأندرويد ===== */
+.ov{background:rgba(15,25,50,.45)}
+.mdl{background:#EEF3FB;color:#1f2a44;border:0;border-radius:26px;box-shadow:0 20px 60px rgba(15,25,50,.35)}
+.mh{border:0;background:linear-gradient(135deg,#1a2c50,#121f3c);margin:10px 10px 0;border-radius:20px;color:#fff}
+.mh h3,.mh h3 *{color:#fff!important}
+.mh .btn,.mh .btn.sm{background:linear-gradient(135deg,#1e6eff,#0a32be);color:#fff;border:0}
+.mf{border:0}
+.mdl label{color:#64708a}
+.mdl input,.mdl textarea{background:#fff;border:1px solid #9fb3d9;color:#1f2a44;border-radius:14px}
+.mdl input:focus,.mdl textarea:focus{border-color:#1e6eff}
+.mdl .g{color:#0f7a50}.mdl .b{color:#1e6eff}.mdl .y{color:#b07800}.mdl .r{color:#d6362a}.mdl .p{color:#6b3fd4}
+.mdl .note{color:#64708a}
+.mdl .chip{background:linear-gradient(135deg,#fff,#e8f0ff);border:0;color:#1f2a44}
+.mdl .chipbtn.on{background:linear-gradient(135deg,#1e6eff,#0a32be);color:#fff}
+.mdl .chk{color:#1f2a44}
+.mdl th{background:#EEF3FB;color:#64708a;border-bottom:1px solid #cfdaf0}
+.mdl th.on{color:#1e6eff}
+.mdl td{border-bottom:1px solid #dbe6fb;color:#1f2a44}
+.mdl tbody tr:hover td{background:#e3ecfb}
+.mdl .kick{background:linear-gradient(135deg,#ff6a5c,#d6362a);color:#fff;border:0;border-radius:12px;padding:4px 12px}
+.mdl tr.lv2 td{background:#fff1ef}.mdl tr.lv2 td.msg{color:#d6362a;font-weight:700}
+.mdl tr.lv1 td{background:#fffaf0}.mdl tr.lv1 td.msg{color:#9a6a00}
+.mdl pre{color:#1f2a44}
+.toast{background:#fff;color:#1f2a44;border:0;border-radius:16px}
+.btn.exit{background:linear-gradient(135deg,#ff6a5c,#d6362a);color:#fff;border:0;font-weight:700}
+.fl{position:relative;margin-top:16px}
+.fl label{position:absolute;top:-8px;right:14px;background:#EEF3FB;padding:0 5px;font-size:11px;color:#1e6eff;margin:0;z-index:1}
+.fl input,.fl textarea{padding:13px 14px;border-radius:14px}
+.fl textarea{min-height:130px}
+.box{background:linear-gradient(135deg,#fff,#e8f0ff);border-radius:18px;padding:10px 14px;margin-top:16px}
+.box .chk{margin-top:8px}
+.rs{position:fixed;inset:0;background:#EEF3FB;z-index:40;overflow:auto}
+.rsin{max-width:760px;margin:0 auto;padding:22px 18px 110px}
+.rhead{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,#1a2c50,#121f3c);border-radius:26px;padding:16px 20px;color:#fff}
+.rhead .tt{flex:1}.rhead .tt b{font-size:22px;display:block}.rhead .tt span{color:#b8c6e6;font-size:13px}
+.rc{display:flex;align-items:center;gap:14px;margin-top:14px;padding:16px 16px;border-radius:24px;background:linear-gradient(135deg,#fff,#e8f0ff);cursor:pointer;color:#1f2a44}
+.rc.act{background:linear-gradient(135deg,#e9fbf3,#c9f1de)}
+.rc:hover{filter:brightness(.98)}
+.rc .ic{width:54px;height:54px;border-radius:18px;background:linear-gradient(135deg,#dbe6fb,#c3d6f7);display:flex;align-items:center;justify-content:center;font-size:26px}
+.rc .inf{flex:1;min-width:0}.rc .inf b{font-size:18px;display:block}.rc.act .inf b{color:#0f7a50}
+.rc .inf span{color:#64708a;font-size:13px;direction:ltr;unicode-bidi:isolate;display:inline-block}
+.rc .ib{border:0;background:none;font-size:22px;cursor:pointer;padding:6px 8px;border-radius:12px}
+.rc .ib:hover{background:#fff}
+.fab{position:fixed;left:26px;bottom:26px;width:68px;height:68px;border-radius:24px;border:0;background:linear-gradient(135deg,#1e6eff,#0a32be);color:#fff;font-size:38px;cursor:pointer;box-shadow:0 10px 26px rgba(30,110,255,.45);z-index:41}
+.btn.go{background:linear-gradient(135deg,#18be82,#109664);color:#fff;border:0;font-weight:700;padding:12px 20px}
 </style>
 </head>
 <body>
@@ -1106,8 +1399,9 @@ header h1{color:#0f1932}
   <header>
     <h1 id="title">📡 Net Microtik Monitor</h1>
     <button class="btn" onclick="refreshNow()">🔄 تحديث</button>
+    <button class="btn" onclick="showRouters()">🔀 الراوترات</button>
     <button class="btn" onclick="openSettings()">⚙️ الإعدادات</button>
-    <button class="btn red" onclick="quitApp()">⏻ إيقاف</button>
+    <button class="btn exit" onclick="quitApp()">✖ خروج</button>
   </header>
   <div id="banner">جارٍ الاتصال بالراوتر...</div>
 
@@ -1147,6 +1441,7 @@ header h1{color:#0f1932}
     </div>
   </div>
 </div>
+<div id="rs" class="rs" style="display:none"></div>
 <div id="ov"></div>
 <div class="toasts" id="toasts"></div>
 
@@ -1182,7 +1477,8 @@ function setBanner(t,col){
 
 function render(){
   const s=S.snap, mods=S.modems||[], dn=mods.filter(m=>!m.up);
-  if(!S.configured){ setBanner('⚙️ أدخل بيانات الراوتر من زر الإعدادات','#58a6ff'); if(!askedSettings){askedSettings=true;openSettings();} }
+  if(!askedSettings){ askedSettings=true; showRouters(true); }
+  if(!S.configured){ setBanner('🔀 اختر راوتراً من قائمة الراوترات','#58a6ff'); }
   else if(S.error) setBanner('⚠️ تعذر الاتصال بالراوتر: '+S.error,'#f85149');
   else if(!s) setBanner('جارٍ الاتصال بالراوتر...','#8b949e');
   else if(!s.wanUp) setBanner('🔴 انقطاع الإنترنت (الواجهة '+s.wan+')','#f85149');
@@ -1406,28 +1702,71 @@ function quitApp(){
   });
 }
 
-/* ---------- الإعدادات ---------- */
+/* ---------- الراوترات المحفوظة (الشاشة الأولى) ---------- */
+let RT=null;
+async function showRouters(first){
+  RT=await api('/api/routers');
+  const cards=RT.list.map(r=>`<div class="rc ${r.id===RT.active?'act':''}" onclick="enterRouter('${r.id}')">
+      <div class="ic">📡</div>
+      <div class="inf"><b>${esc(r.name||r.local||r.cloud||'راوتر')}${r.id===RT.active?'  ● مراقَب الآن':''}</b><span>${esc(r.user)}@${esc(r.local||r.cloud)}:${esc(r.port)}</span></div>
+      <button class="ib" title="تعديل" onclick="event.stopPropagation();loginPage('${r.id}')">✏️</button>
+      <button class="ib" title="حذف" onclick="event.stopPropagation();delRouter('${r.id}')">🗑</button></div>`).join('');
+  $('rs').innerHTML=`<div class="rsin"><div class="rhead"><div class="tt"><b>Net Microtik Monitor</b><span>اختر الراوتر للمراقبة</span></div>
+    ${RT.list.length&&S&&S.configured?`<button class="btn" onclick="hideRouters()">رجوع</button>`:''}
+    <button class="btn exit" onclick="quitApp()">✖ خروج</button></div>
+    ${cards||'<div class="note" style="padding:30px;text-align:center">لا توجد راوترات محفوظة. اضغط + لإضافة راوتر.</div>'}</div>
+    <button class="fab" title="إضافة راوتر" onclick="loginPage(null)">+</button>`;
+  $('rs').style.display='block';
+  if(first&&!RT.list.length) loginPage(null);
+}
+function hideRouters(){ $('rs').style.display='none'; }
+async function enterRouter(id){
+  await api('/api/routers',{op:'enter',id}); hideRouters(); modsSig=''; LOGS=[]; logV=''; toast('🔗 جارٍ الاتصال بالراوتر...','','#58a6ff');
+}
+function delRouter(id){
+  const r=RT.list.find(x=>x.id===id); if(!r) return;
+  confirmBox('حذف الراوتر',`حذف "${esc(r.name||r.local||r.cloud)}" من القائمة المحفوظة؟`,'حذف',async()=>{ await api('/api/routers',{op:'delete',id}); modsSig=''; LOGS=[]; logV=''; showRouters(); });
+}
+const fl=(id,label,val,type='text',ph='')=>`<div class="fl"><label>${label}</label><input id="${id}" type="${type}" value="${esc(val)}" placeholder="${esc(ph)}"></div>`;
+// صفحة تسجيل الدخول: راوتر جديد أو تعديل. بدون مودمات ولا تنبيهات.
+function loginPage(id){
+  const r=id?RT.list.find(x=>x.id===id):null, v=k=>r?r[k]:'';
+  modal(r?'✏️ تعديل الراوتر':'➕ إضافة راوتر',
+    `${fl('l_name','🏷️ اسم الراوتر',v('name'),'text','شبكة النور')}
+     ${fl('l_local','عنوان الراوتر (IP أو DNS)',v('local'),'text','192.168.88.1')}
+     ${fl('l_cloud','عنوان الكلاود (اختياري)',v('cloud'),'text','xxxx.sn.mynetname.net')}
+     <div class="grid2">${fl('l_user','اسم المستخدم',v('user'))}${fl('l_port','منفذ API',r?v('port'):'8728','text','8728')}</div>
+     ${fl('l_pass','كلمة المرور',v('pass'),'password')}
+     <div class="box"><label class="chk" style="margin:0"><input type="checkbox" id="l_rem" ${(!r||v('pass'))?'checked':''} style="width:auto"> 🔐 حفظ بيانات الدخول</label></div>
+     <div id="l_err" class="r" style="margin-top:10px"></div>`,
+    `<button class="btn go" id="sv">حفظ</button><button class="btn" onclick="closeModal()">إلغاء</button>`);
+  $('sv').onclick=async()=>{
+    const b={op:'save',id:id||'',remember:$('l_rem').checked};
+    [['name','l_name'],['local','l_local'],['cloud','l_cloud'],['user','l_user'],['port','l_port'],['pass','l_pass']].forEach(([k,e])=>b[k]=$(e).value);
+    const res=await api('/api/routers',b);
+    if(!res.ok){ $('l_err').textContent=res.msg||'تعذر الحفظ'; return; }
+    closeModal(); modsSig=''; LOGS=[]; logV='';
+    if(res.entered){ hideRouters(); toast('✅ تم الحفظ — جارٍ الاتصال...','','#3fb950'); } else showRouters();
+  };
+}
+
+/* ---------- إعدادات الراوتر الحالي (داخل اللوحة): المودمات + الواجهة + التنبيهات ---------- */
 async function openSettings(){
   const c=await api('/api/settings');
-  const f=(k,label,type='text',ph='')=>`<div><label>${label}</label><input id="f_${k}" type="${type}" value="${esc(c[k])}" placeholder="${esc(ph)}" dir="ltr" style="text-align:right"></div>`;
-  modal('⚙️ إعدادات الاتصال والمراقبة',
-    `${f('name','🏷️ اسم الشبكة','text','مثال: شبكة النور').replace('dir="ltr" style="text-align:right"','')}
-     <div class="grid2">${f('local','عنوان الراوتر المحلي','text','192.168.88.1')}${f('cloud','عنوان الكلاود','text','xxxx.sn.mynetname.net')}
-     ${f('user','اسم المستخدم')}${f('pass','كلمة المرور','password')}
-     ${f('port','منفذ API','text','8728')}${f('wan','واجهة الإنترنت','text','ether1')}</div>
-     <label>المودمات — سطر لكل مودم: الاسم و IP (الاسم حر)</label>
-     <textarea id="f_modems" placeholder="90.90.2.2 شيبان&#10;90.90.3.3 اكرم">${esc(c.modems)}</textarea>
-     <label style="margin-top:16px;font-weight:700">🔔 تنبيهات سجل الراوتر (LOG)</label>
-     <label class="chk" style="margin-top:4px"><input type="checkbox" id="f_nErr" ${c.notifErr==='1'?'checked':''}> 🔴 تنبيه فوري عند أي خطأ أحمر (موصى به)</label>
-     <label class="chk" style="margin-top:6px"><input type="checkbox" id="f_nWarn" ${c.notifWarn==='1'?'checked':''}> 🟡 تنبيه للتحذيرات الصفراء أيضاً</label>
-     ${c.isWin?`<label class="chk"><input type="checkbox" id="f_auto" ${c.autostart?'checked':''}> تشغيل البرنامج تلقائياً مع ويندوز (مراقبة وتنبيهات بالخلفية)</label>`:''}`,
-    `<button class="btn primary" id="sv">حفظ واتصال</button><button class="btn" onclick="closeModal()">إلغاء</button>`);
-  document.querySelector('.mdl').style.width='min(720px,100%)';
+  modal('⚙️ إعدادات '+esc(S&&S.name||'الراوتر'),
+    `${fl('f_wan','واجهة الإنترنت (WAN)',c.wan,'text','ether1')}
+     <div class="fl"><label>المودمات: سطر لكل مودم (IP ثم الاسم)</label><textarea id="f_modems" placeholder="90.90.2.2 شيبان&#10;90.90.3.3 اكرم">${esc(c.modems)}</textarea></div>
+     <div class="box">
+     <label class="chk" style="margin-top:0"><input type="checkbox" id="f_nErr" ${c.notifErr==='1'?'checked':''}> 🔴 إشعار فوري عند أي خطأ أحمر في السجل</label>
+     <label class="chk"><input type="checkbox" id="f_nWarn" ${c.notifWarn==='1'?'checked':''}> 🟡 إشعار للتحذيرات الصفراء أيضاً</label>
+     ${c.isWin?`<label class="chk"><input type="checkbox" id="f_auto" ${c.autostart?'checked':''}> تشغيل البرنامج تلقائياً مع ويندوز (مراقبة وتنبيهات بالخلفية)</label>`:''}</div>`,
+    `<button class="btn go" id="sv">حفظ</button><button class="btn" onclick="closeModal()">إلغاء</button>`);
+  document.querySelector('.mdl').style.width='min(620px,100%)';
   $('sv').onclick=async()=>{
-    const b={}; ['name','local','cloud','user','pass','port','wan','modems'].forEach(k=>b[k]=$('f_'+k).value.trim());
+    const b={wan:$('f_wan').value.trim()||'ether1',modems:$('f_modems').value.trim()};
     b.notifErr=$('f_nErr').checked?'1':'0'; b.notifWarn=$('f_nWarn').checked?'1':'0';
     b.autostart=!!($('f_auto')&&$('f_auto').checked);
-    await api('/api/settings',b); closeModal(); modsSig=''; LOGS=[]; logV=''; toast('✅ تم الحفظ — جارٍ الاتصال...','','#3fb950');
+    await api('/api/settings',b); closeModal(); modsSig=''; LOGS=[]; logV=''; toast('✅ تم الحفظ','','#3fb950');
   };
 }
 
