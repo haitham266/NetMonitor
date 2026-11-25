@@ -1,0 +1,1 @@
+Release signing: EC P-256 key. Private key is stored only in the vault (two items "NetMonitor Android signing key part 1/2 of 2", concatenate = base64 PKCS8). netmonitor-cert.pem is the public certificate (SHA-256 F5:81:46:44:C9:93:C7:3A:E7:B0:E9:1B:31:0E:9D:A8:8D:0C:FC:2B:61:7A:82:80:40:9D:EC:F9:70:C5:87:FF).
