@@ -2045,6 +2045,74 @@ class MainActivity : Activity() {
         applyConfigChange()
     }
 
+    // ---------- تحديث التطبيق ----------
+    private var updInfo: UpdateInfo? = null
+    private var updRow: TextView? = null
+    private var updBusy = false
+
+    private fun updateRow(): TextView {
+        val v = TextView(this).apply {
+            textSize = 12f; gravity = Gravity.CENTER; setPadding(dp(12), dp(8), dp(12), dp(8))
+            setTextColor(c("#46618f")); background = grad("#ffffff", "#e8f0ff", 14)
+        }
+        updRow = v
+        renderUpdateRow()
+        v.setOnClickListener { onUpdateTap() }
+        checkForUpdate(false)
+        return v
+    }
+
+    private fun renderUpdateRow(msg: String? = null) {
+        val v = updRow ?: return
+        val cur = Updater.currentVersion(this).second
+        val u = updInfo
+        if (msg != null) { v.text = msg; return }
+        if (u != null) {
+            v.text = "⬆ تحديث متوفر: ${u.versionName} (الحالي $cur) - اضغط للتنزيل والتثبيت"
+            v.setTextColor(c("#ffffff")); v.background = grad("#1fbf75", "#0e8f55", 14)
+        } else {
+            v.text = "الإصدار $cur • اضغط للتحقق من التحديث"
+            v.setTextColor(c("#46618f")); v.background = grad("#ffffff", "#e8f0ff", 14)
+        }
+    }
+
+    private fun checkForUpdate(manual: Boolean) {
+        if (updBusy) return
+        updBusy = true
+        if (manual) renderUpdateRow("جارٍ التحقق من التحديث...")
+        Thread {
+            var err: String? = null
+            try { updInfo = Updater.check(this) } catch (e: Exception) { err = e.message ?: "فشل الاتصال" }
+            runOnUiThread {
+                updBusy = false
+                renderUpdateRow()
+                if (manual) {
+                    if (err != null) Toast.makeText(this, "تعذر التحقق: $err", Toast.LENGTH_LONG).show()
+                    else if (updInfo == null) Toast.makeText(this, "أنت على آخر إصدار", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun onUpdateTap() {
+        val u = updInfo
+        if (u == null) { checkForUpdate(true); return }
+        if (updBusy) return
+        if (!Updater.canInstall(this)) {
+            Toast.makeText(this, "فعّل السماح بتثبيت التطبيقات لهذا التطبيق ثم ارجع واضغط تحديث", Toast.LENGTH_LONG).show()
+            Updater.openInstallPermission(this); return
+        }
+        updBusy = true
+        Thread {
+            try {
+                val f = Updater.download(this, u) { p -> runOnUiThread { renderUpdateRow("جارٍ التنزيل... $p%") } }
+                runOnUiThread { updBusy = false; renderUpdateRow(); Updater.install(this, f) }
+            } catch (e: Exception) {
+                runOnUiThread { updBusy = false; renderUpdateRow(); Toast.makeText(this, "فشل التحديث: ${e.message}", Toast.LENGTH_LONG).show() }
+            }
+        }.start()
+    }
+
     private var routersDlg: android.app.Dialog? = null
 
     private fun fullDialog(root: View): android.app.Dialog {
@@ -2074,6 +2142,7 @@ class MainActivity : Activity() {
             setOnClickListener { confirmExit() }
         })
         col.addView(head)
+        col.addView(updateRow(), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         col.addView(ScrollView(this).apply { addView(listBox) }, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(10) })
         frame.addView(col, FrameLayout.LayoutParams(-1, -1))
