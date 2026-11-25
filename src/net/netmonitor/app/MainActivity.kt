@@ -233,7 +233,7 @@ object Net {
             val le = lastErr
             if (le != null && now - lastFail < 2500) throw le
             try {
-                val r = Net.get(prefs)
+                val r = rosConnect(prefs)
                 cur = r; lastErr = null
                 return r
             } catch (e: Exception) {
