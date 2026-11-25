@@ -1,0 +1,125 @@
+-- Merging decision tree log ---
+manifest
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:1:1-50:12
+INJECTED from /tmp/NetMonitor/AndroidManifest.xml:1:1-50:12
+INJECTED from /tmp/NetMonitor/AndroidManifest.xml:1:1-50:12
+INJECTED from /tmp/NetMonitor/AndroidManifest.xml:1:1-50:12
+	package
+		INJECTED from /tmp/NetMonitor/AndroidManifest.xml
+	android:versionName
+		INJECTED from /tmp/NetMonitor/AndroidManifest.xml
+	android:versionCode
+		INJECTED from /tmp/NetMonitor/AndroidManifest.xml
+	xmlns:android
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:1:11-69
+uses-permission#android.permission.INTERNET
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:3:5-66
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:3:22-64
+uses-permission#android.permission.ACCESS_NETWORK_STATE
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:4:5-78
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:4:22-76
+uses-permission#android.permission.ACCESS_WIFI_STATE
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:5:5-75
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:5:22-73
+uses-permission#android.permission.CHANGE_NETWORK_STATE
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:6:5-78
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:6:22-76
+uses-permission#android.permission.CHANGE_WIFI_STATE
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:7:5-75
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:7:22-73
+uses-permission#android.permission.WAKE_LOCK
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:8:5-67
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:8:22-65
+uses-permission#android.permission.FOREGROUND_SERVICE
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:9:5-76
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:9:22-74
+uses-permission#android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:10:5-93
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:10:22-91
+uses-permission#android.permission.POST_NOTIFICATIONS
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:11:5-76
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:11:22-74
+uses-permission#android.permission.RECEIVE_BOOT_COMPLETED
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:12:5-80
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:12:22-78
+uses-permission#android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:13:5-94
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:13:22-92
+application
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:15:5-49:19
+INJECTED from /tmp/NetMonitor/AndroidManifest.xml:15:5-49:19
+	android:extractNativeLibs
+		INJECTED from /tmp/NetMonitor/AndroidManifest.xml
+	android:supportsRtl
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:19:9-35
+	android:label
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:16:9-45
+	android:roundIcon
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:18:9-48
+	android:icon
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:17:9-43
+	android:theme
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:20:9-71
+activity#net.netmonitor.app.MainActivity
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:22:9-31:20
+	android:launchMode
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:25:13-44
+	android:exported
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:24:13-36
+	android:configChanges
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:26:13-74
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:23:13-59
+intent-filter#action:name:android.intent.action.MAIN+category:name:android.intent.category.LAUNCHER
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:27:13-30:29
+action#android.intent.action.MAIN
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:28:17-68
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:28:25-66
+category#android.intent.category.LAUNCHER
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:29:17-76
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:29:27-74
+service#net.netmonitor.app.MonitorService
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:34:9-37:62
+	android:exported
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:36:13-37
+	android:foregroundServiceType
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:37:13-60
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:35:13-61
+receiver#net.netmonitor.app.BootReceiver
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:40:9-47:20
+	android:exported
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:42:13-36
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:41:13-59
+intent-filter#action:name:android.intent.action.BOOT_COMPLETED+action:name:android.intent.action.MY_PACKAGE_REPLACED
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:43:13-46:29
+action#android.intent.action.BOOT_COMPLETED
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:44:17-78
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:44:25-76
+action#android.intent.action.MY_PACKAGE_REPLACED
+ADDED from /tmp/NetMonitor/AndroidManifest.xml:45:17-83
+	android:name
+		ADDED from /tmp/NetMonitor/AndroidManifest.xml:45:25-81
+uses-sdk
+INJECTED from /tmp/NetMonitor/AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from /tmp/NetMonitor/AndroidManifest.xml
+INJECTED from /tmp/NetMonitor/AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from /tmp/NetMonitor/AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from /tmp/NetMonitor/AndroidManifest.xml

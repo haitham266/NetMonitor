@@ -49,20 +49,44 @@ fun netName(p: SharedPreferences): String = p.getString("name", null)?.trim().le
 
 class Trap(m: String) : Exception(m)
 
+// اتصال API واحد مشترك: كل الأوامر تمر على نفس الجلسة (وسوم .tag) فلا تتكرر عمليات الدخول
 class Ros(host: String, port: Int, timeout: Int) {
     private val s = Socket()
     private val ins: InputStream
     private val out: OutputStream
+    @Volatile var dead = false
+    private val tagSeq = java.util.concurrent.atomic.AtomicInteger(1)
+    private val calls = ConcurrentHashMap<String, Call>()
+    private val wlock = Any()
+    private var reader: Thread? = null
+
+    private class Call(val onRe: ((Map<String, String>) -> Unit)?) {
+        val rows = ArrayList<Map<String, String>>()
+        @Volatile var err: String? = null
+        @Volatile var fatal: Exception? = null
+        @Volatile var ret: String? = null
+        val latch = java.util.concurrent.CountDownLatch(1)
+    }
 
     init {
         s.connect(InetSocketAddress(host, port), timeout)
         s.soTimeout = 15000
         s.keepAlive = true
+        s.tcpNoDelay = true
         ins = s.getInputStream()
         out = s.getOutputStream()
     }
 
-    fun close() { try { s.close() } catch (e: Exception) { } }
+    fun close() {
+        dead = true
+        try { s.close() } catch (e: Exception) { }
+        failAll(IOException("closed"))
+    }
+
+    private fun failAll(e: Exception) {
+        for (c in calls.values) { c.fatal = e; c.latch.countDown() }
+        calls.clear()
+    }
 
     private fun wlen(n: Int) {
         when {
@@ -74,10 +98,6 @@ class Ros(host: String, port: Int, timeout: Int) {
 
     private fun rb(): Int { val c = ins.read(); if (c < 0) throw IOException("closed"); return c }
 
-    fun setTimeout(ms: Int) { s.soTimeout = ms }
-
-    private fun rlen(): Int = rlenFrom(rb())
-
     private fun rlenFrom(c: Int): Int {
         return when {
             (c and 0x80) == 0 -> c
@@ -88,17 +108,10 @@ class Ros(host: String, port: Int, timeout: Int) {
         }
     }
 
-    // idleOk: يرجع null إذا لم تصل أي بيانات خلال مهلة القراءة (للبث المستمر)
-    private fun readSentence(idleOk: Boolean = false): List<String>? {
+    private fun readSentence(): List<String> {
         val w = ArrayList<String>()
-        var firstWord = true
         while (true) {
-            val n = if (firstWord) {
-                firstWord = false
-                val c = try { ins.read() } catch (e: java.net.SocketTimeoutException) { if (idleOk) return null else throw e }
-                if (c < 0) throw IOException("closed")
-                rlenFrom(c)
-            } else rlen()
+            val n = rlenFrom(rb())
             if (n == 0) return w
             val b = ByteArray(n)
             var o = 0
@@ -116,51 +129,128 @@ class Ros(host: String, port: Int, timeout: Int) {
         return m
     }
 
-    private fun send(words: Array<out String>) {
-        for (w in words) { val b = w.toByteArray(Charsets.UTF_8); wlen(b.size); out.write(b) }
-        out.write(0)
-        out.flush()
+    private fun tagOf(sn: List<String>): String? {
+        for (w in sn) if (w.startsWith(".tag=")) return w.substring(5)
+        return null
     }
 
-    @Synchronized
-    fun streamImpl(words: Array<String>, stop: () -> Boolean, onIdle: () -> Unit, onRe: (Map<String, String>) -> Unit) {
-        send(words)
-        var err: String? = null
-        while (true) {
-            if (stop()) throw IOException("stop")
-            val sn = readSentence(true)
-            if (sn == null) { onIdle(); continue }
-            if (sn.isEmpty()) continue
-            when (sn[0]) {
-                "!re" -> onRe(attrs(sn))
-                "!trap" -> err = attrs(sn)["message"] ?: "error"
-                "!fatal" -> throw IOException("fatal")
-                "!done" -> { if (err != null) throw Trap(err); return }
-            }
+    private fun send(words: List<String>) {
+        synchronized(wlock) {
+            for (w in words) { val b = w.toByteArray(Charsets.UTF_8); wlen(b.size); out.write(b) }
+            out.write(0)
+            out.flush()
         }
     }
 
-    @Synchronized
-    fun cmd(vararg words: String): List<Map<String, String>> {
-        send(words)
-        val res = ArrayList<Map<String, String>>()
+    // تسجيل الدخول: مرة واحدة فقط لكل اتصال، قبل تشغيل قارئ الردود
+    fun login(user: String, pass: String) {
+        send(listOf("/login", "=name=$user", "=password=$pass"))
         var err: String? = null
         while (true) {
-            val sn = readSentence()!!
+            val sn = readSentence()
             if (sn.isEmpty()) continue
             when (sn[0]) {
-                "!re" -> res.add(attrs(sn))
                 "!trap" -> err = attrs(sn)["message"] ?: "error"
                 "!fatal" -> throw IOException("fatal")
-                "!done" -> {
-                    if (err != null) throw Trap(err)
-                    val ret = attrs(sn)["ret"]
-                    if (ret != null && res.isEmpty()) res.add(mapOf("ret" to ret))
-                    return res
+                "!done" -> { if (err != null) throw Trap(err); break }
+            }
+        }
+        s.soTimeout = 0
+        reader = Thread { readLoop() }.apply { isDaemon = true; start() }
+    }
+
+    private fun readLoop() {
+        try {
+            while (!dead) {
+                val sn = readSentence()
+                if (sn.isEmpty()) continue
+                val tag = tagOf(sn) ?: continue
+                val c = calls[tag] ?: continue
+                when (sn[0]) {
+                    "!re" -> { val a = attrs(sn); if (c.onRe != null) c.onRe.invoke(a) else synchronized(c.rows) { c.rows.add(a) } }
+                    "!trap" -> c.err = attrs(sn)["message"] ?: "error"
+                    "!fatal" -> { c.fatal = IOException("fatal"); calls.remove(tag); c.latch.countDown() }
+                    "!done" -> { c.ret = attrs(sn)["ret"]; calls.remove(tag); c.latch.countDown() }
                 }
             }
+        } catch (e: Exception) {
+            dead = true
+            try { s.close() } catch (x: Exception) { }
+            failAll(if (e is IOException) e else IOException(e.message))
         }
     }
+
+    private fun start(words: Array<out String>, onRe: ((Map<String, String>) -> Unit)?): Pair<String, Call> {
+        if (dead) throw IOException("closed")
+        val tag = tagSeq.getAndIncrement().toString()
+        val c = Call(onRe)
+        calls[tag] = c
+        try { send(words.toList() + ".tag=$tag") } catch (e: Exception) { calls.remove(tag); close(); throw e }
+        return tag to c
+    }
+
+    // أمر عادي: ينتظر الرد (يمكن تشغيل عدة أوامر بالتوازي على نفس الاتصال)
+    fun cmd(vararg words: String): List<Map<String, String>> {
+        val (tag, c) = start(words, null)
+        if (!c.latch.await(20, java.util.concurrent.TimeUnit.SECONDS)) {
+            calls.remove(tag); close(); throw IOException("timeout")
+        }
+        c.fatal?.let { throw if (it is IOException) it else IOException(it.message) }
+        c.err?.let { throw Trap(it) }
+        val res = ArrayList<Map<String, String>>(synchronized(c.rows) { c.rows })
+        val ret = c.ret
+        if (ret != null && res.isEmpty()) res.add(mapOf("ret" to ret))
+        return res
+    }
+
+    // بث مستمر (سجل الراوتر المباشر) على نفس الاتصال
+    fun streamImpl(words: Array<String>, stop: () -> Boolean, onIdle: () -> Unit, onRe: (Map<String, String>) -> Unit) {
+        val (tag, c) = start(words, onRe)
+        try {
+            while (true) {
+                if (stop()) { try { send(listOf("/cancel", "=tag=$tag")) } catch (e: Exception) { }; throw IOException("stop") }
+                if (c.latch.await(3, java.util.concurrent.TimeUnit.SECONDS)) break
+                onIdle()
+            }
+        } finally { calls.remove(tag) }
+        c.fatal?.let { throw if (it is IOException) it else IOException(it.message) }
+        c.err?.let { if (it != "interrupted") throw Trap(it) }
+    }
+}
+
+// مدير الاتصال: جلسة واحدة فقط مع الراوتر يستخدمها الجميع
+object Net {
+    private val lock = Any()
+    private var cur: Ros? = null
+    private var lastFail = 0L
+    private var lastErr: Exception? = null
+
+    fun get(prefs: SharedPreferences): Ros {
+        synchronized(lock) {
+            val c = cur
+            if (c != null && !c.dead) return c
+            val now = System.currentTimeMillis()
+            val le = lastErr
+            if (le != null && now - lastFail < 2500) throw le
+            try {
+                val r = Net.get(prefs)
+                cur = r; lastErr = null
+                return r
+            } catch (e: Exception) {
+                lastErr = e; lastFail = System.currentTimeMillis()
+                throw e
+            }
+        }
+    }
+
+    fun drop(r: Ros?) {
+        synchronized(lock) {
+            if (r != null) { try { r.close() } catch (e: Exception) { } }
+            if (cur === r || cur?.dead == true) cur = null
+        }
+    }
+
+    fun reset() { synchronized(lock) { try { cur?.close() } catch (e: Exception) { }; cur = null; lastErr = null } }
 }
 
 // سطر من سجل الراوتر: level 2 = أحمر (error/critical) ، 1 = أصفر (warning) ، 0 = عادي
@@ -190,6 +280,7 @@ class Snapshot(
 )
 
 object Shared {
+    @Volatile var activity: java.lang.ref.WeakReference<Activity>? = null
     @Volatile var snap: Snapshot? = null
     @Volatile var modems: List<ModemStat> = emptyList()
     @Volatile var modemsReady = false
@@ -238,7 +329,7 @@ fun rosConnect(prefs: SharedPreferences): Ros {
         var r: Ros? = null
         try {
             r = Ros(h, port, t)
-            r.cmd("/login", "=name=" + prefs.getString("user", ""), "=password=" + prefs.getString("pass", ""))
+            r.login(prefs.getString("user", "").orEmpty(), prefs.getString("pass", "").orEmpty())
             Shared.via = if (k == "local") "محلي LAN" else "كلاود Cloud"
             return r
         } catch (e: Exception) { r?.close(); last = e }
@@ -301,8 +392,17 @@ class MonitorService : Service() {
         if (intent?.action == "STOP") {
             prefs.edit().putBoolean("enabled", false).apply()
             running = false
+            Net.reset()
+            try {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.cancelAll()
+            } catch (e: Exception) { }
             stopForeground(true)
             stopSelf()
+            val act = Shared.activity?.get()
+            Handler(Looper.getMainLooper()).post { try { act?.finishAndRemoveTask() } catch (e: Exception) { } }
+            // إنهاء العملية بالكامل حتى لا يبقى شيء يعمل بالخلفية
+            Handler(Looper.getMainLooper()).postDelayed({ android.os.Process.killProcess(android.os.Process.myPid()) }, 600)
             return START_NOT_STICKY
         }
         goForeground(if (lastNotifText.isEmpty()) "جارٍ الاتصال بالراوتر..." else lastNotifText)
@@ -336,6 +436,7 @@ class MonitorService : Service() {
 
     override fun onDestroy() {
         running = false
+        Net.reset()
         try { stopForeground(true) } catch (e: Exception) { }
         try { wl?.release() } catch (e: Exception) { }
         try { wifiLock?.release() } catch (e: Exception) { }
@@ -399,12 +500,12 @@ class MonitorService : Service() {
 
         while (running) {
             if (myGen != Shared.cfgGen) {
-                ros?.close(); ros = null
+                Net.reset(); ros = null
                 myGen = Shared.cfgGen
                 prevIf.clear()
             }
             try {
-                val r = ros ?: rosConnect(prefs).also { ros = it }
+                val r = Net.get(prefs).also { ros = it }
                 val res = r.cmd("/system/resource/print").firstOrNull() ?: emptyMap()
                 val hl = HashMap<String, String>()
                 try {
@@ -490,13 +591,13 @@ class MonitorService : Service() {
                             " • مودمات $mUp/${mods.size}"
                 )
             } catch (e: Exception) {
-                ros?.close(); ros = null
+                if (e !is Trap) Net.drop(ros)
+                ros = null
                 Shared.error = e.message ?: "خطأ غير معروف"
                 updateNotif("⚠️ تعذر الاتصال بالراوتر — جارٍ إعادة المحاولة")
             }
             nap(2000)
         }
-        ros?.close()
     }
 
     // ---------- سجل الراوتر: بث لحظي + إشعار للأحمر ----------
@@ -564,7 +665,7 @@ class MonitorService : Service() {
                 }
             }
             try {
-                r = rosConnect(prefs)
+                r = Net.get(prefs)
                 // أول مرة: نحمل السجل بدون إشعارات. عند إعادة الاتصال: نُشعر بما فاتنا فقط
                 val firstTime = !Shared.logsReady
                 val init = r.cmd("/log/print", "=.proplist=.id,time,topics,message").mapNotNull { toLogEntry(it) }
@@ -577,23 +678,21 @@ class MonitorService : Service() {
                 Shared.logsReady = true; Shared.logError = null; Shared.logVer++
                 flush(true)
 
-                r.setTimeout(3000)
                 var idleMs = 0L
                 val gen = myGen
                 r.streamImpl(
                     arrayOf("/log/print", "=follow-only=", "=.proplist=.id,time,topics,message"),
-                    stop = { !running || gen != Shared.cfgGen || idleMs > 300000 },
+                    stop = { !running || gen != Shared.cfgGen },
                     onIdle = { idleMs += 3000; flush(false) },
                     onRe = { m -> idleMs = 0; toLogEntry(m)?.let { addLogs(listOf(it), true, pending) }; flush(false) }
                 )
             } catch (e: Trap) {
                 Shared.logError = e.message; Shared.logVer++
-                r?.close(); nap(15000); continue
+                nap(15000); continue
             } catch (e: Exception) {
-                wait = if (e.message == "stop") 200L else 5000L
+                if (e.message == "stop") wait = 200L else { wait = 5000L; Net.drop(r) }
             } finally {
                 flush(true)
-                r?.close()
             }
             nap(wait)
         }
@@ -601,14 +700,12 @@ class MonitorService : Service() {
 
     // ---------- حلقة المودمات: فحص متوازي بعدة اتصالات (كل ~3 ثواني) ----------
     private fun modemLoop() {
-        val conns = arrayOfNulls<Ros>(5)
         var myGen = Shared.cfgGen
         var lastDown = HashSet<String>()
         var firstDone = false
 
         while (running) {
             if (myGen != Shared.cfgGen) {
-                for (i in conns.indices) { conns[i]?.close(); conns[i] = null }
                 myGen = Shared.cfgGen
             }
             Shared.forceModem = false
@@ -623,7 +720,7 @@ class MonitorService : Service() {
             }
 
             val prev = Shared.modems.associateBy { it.ip }
-            val workers = if (list.size < conns.size) list.size else conns.size
+            val workers = if (list.size < 5) list.size else 5
             val results = arrayOfNulls<ModemStat>(list.size)
             val threads = ArrayList<Thread>()
 
@@ -633,14 +730,15 @@ class MonitorService : Service() {
                     while (i < list.size) {
                         val name = list[i].first
                         val mIp = list[i].second
+                        var cc: Ros? = null
                         val up: Boolean? = try {
-                            val c = conns[w] ?: rosConnect(prefs).also { conns[w] = it }
+                            val c = Net.get(prefs).also { cc = it }
                             c.cmd("/ping", "=address=$mIp", "=count=2", "=interval=0.5")
                                 .any { (it["received"] ?: "0") != "0" || it["time"] != null }
                         } catch (e: Trap) {
                             false
                         } catch (e: Exception) {
-                            conns[w]?.close(); conns[w] = null
+                            Net.drop(cc)
                             null
                         }
                         val old = prev[mIp]
@@ -677,7 +775,6 @@ class MonitorService : Service() {
 
             nap(3000, true)
         }
-        for (i in conns.indices) { conns[i]?.close() }
     }
 }
 
@@ -752,6 +849,13 @@ class MainActivity : Activity() {
         if (stroke.isNotEmpty()) setStroke(dp(1), c(stroke))
     }
 
+    private fun grad(c1: String, c2: String, radiusDp: Int = 20) = GradientDrawable(
+        GradientDrawable.Orientation.TL_BR, intArrayOf(c(c1), c(c2))
+    ).apply { cornerRadius = dp(radiusDp).toFloat() }
+
+    private val NAV1 = "#1a2c50"
+    private val NAV2 = "#121f3c"
+
     private fun makeProgressDrawable(colorHex: String): LayerDrawable {
         val bg = GradientDrawable().apply { setColor(c("#21262d")); cornerRadius = dp(6).toFloat() }
         val fg = GradientDrawable().apply { setColor(c(colorHex)); cornerRadius = dp(6).toFloat() }
@@ -776,7 +880,7 @@ class MainActivity : Activity() {
         val sec = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = box("#161b22", "#30363d")
+            background = grad(NAV1, NAV2, 22)
         }
         val t = TextView(this).apply {
             text = title
@@ -813,7 +917,9 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = c("#0d1117")
+        Shared.activity = java.lang.ref.WeakReference(this)
+        window.statusBarColor = c("#EEF3FB")
+        if (Build.VERSION.SDK_INT >= 23) window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
 
         if (Build.VERSION.SDK_INT >= 33) {
             try { requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1) } catch (e: Exception) { }
@@ -824,7 +930,7 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(12), dp(12), dp(28))
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
-        setContentView(ScrollView(this).apply { setBackgroundColor(c("#0d1117")); addView(root) })
+        setContentView(ScrollView(this).apply { setBackgroundColor(c("#EEF3FB")); addView(root) })
 
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -833,7 +939,7 @@ class MainActivity : Activity() {
         tvTitle = TextView(this)
         header.addView(tvTitle.apply {
             text = "📡 ${netName(prefs)}"
-            setTextColor(c("#58a6ff"))
+            setTextColor(c("#0f1932"))
             textSize = 19f
             setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
@@ -842,9 +948,9 @@ class MainActivity : Activity() {
         fun actionBtn(label: String, onClick: () -> Unit) = TextView(this).apply {
             text = label
             textSize = 14f
-            setTextColor(c("#e6edf3"))
+            setTextColor(c("#0f1932"))
             setPadding(dp(10), dp(6), dp(10), dp(6))
-            background = box("#21262d", "#30363d", 8)
+            background = grad("#ffffff", "#dfe8f8", 14)
             setOnClickListener { onClick() }
             layoutParams = LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(6) }
         }
@@ -865,48 +971,48 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             setPadding(dp(12), dp(12), dp(12), dp(12))
             text = "جارٍ الاتصال بالراوتر..."
-            setTextColor(c("#8b949e"))
-            background = box("#161b22", "#30363d")
+            setTextColor(c("#ffffff"))
+            background = grad("#6b7a99", "#4a5875", 18)
         }
         root.addView(banner, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
 
         val gridRow1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val gridRow2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 
-        fun makeStatCard(title: String, accentColor: String, hint: String, onClick: (() -> Unit)?): Triple<LinearLayout, TextView, TextView> {
+        fun makeStatCard(title: String, g1: String, g2: String, hint: String, onClick: (() -> Unit)?): Triple<LinearLayout, TextView, TextView> {
             val cardLayout = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(12), dp(10), dp(12), dp(10))
-                background = box("#161b22", "#30363d")
+                background = grad(g1, g2, 20)
                 if (onClick != null) {
                     isClickable = true
                     setOnClickListener { onClick() }
                 }
             }
-            cardLayout.addView(TextView(this).apply { text = title; setTextColor(c("#8b949e")); textSize = 12f })
+            cardLayout.addView(TextView(this).apply { text = title; setTextColor(c("#ffffff")); textSize = 12f })
             val mainVal = TextView(this).apply {
                 text = "-"
-                setTextColor(c(accentColor))
-                textSize = 20f
+                setTextColor(c("#ffffff"))
+                textSize = 22f
                 setTypeface(null, Typeface.BOLD)
                 setPadding(0, dp(4), 0, dp(2))
             }
-            val subVal = TextView(this).apply { text = hint; setTextColor(c("#6e7681")); textSize = 11f }
+            val subVal = TextView(this).apply { text = hint; setTextColor(c("#e6ecff")); textSize = 11f }
             cardLayout.addView(mainVal)
             cardLayout.addView(subVal)
             return Triple(cardLayout, mainVal, subVal)
         }
 
-        val wanTriple = makeStatCard("🌐 حالة الإنترنت (WAN)", "#58a6ff", "اضغط لفحص البنق") { pingDialog("8.8.8.8", "فحص الإنترنت العالمي (Google DNS)") }
+        val wanTriple = makeStatCard("🌐 حالة الإنترنت (WAN)", "#18be82", "#109664", "اضغط لفحص البنق") { pingDialog("8.8.8.8", "فحص الإنترنت العالمي (Google DNS)") }
         tvWanVal = wanTriple.second; tvWanSub = wanTriple.third
 
-        val hostTriple = makeStatCard("👥 HOST", "#3fb950", "اضغط لعرض القائمة") { openList(true) }
+        val hostTriple = makeStatCard("👥 HOST", "#14aac8", "#0a6eaa", "اضغط لعرض القائمة") { openList(true) }
         tvHostVal = hostTriple.second; tvHostSub = hostTriple.third
 
-        val activeTriple = makeStatCard("🔌 ACTIVE", "#a371f7", "اضغط لعرض القائمة") { openList(false) }
+        val activeTriple = makeStatCard("🔌 ACTIVE", "#e65a96", "#be326e", "اضغط لعرض القائمة") { openList(false) }
         tvActiveVal = activeTriple.second
 
-        val modTriple = makeStatCard("📡 المودمات المتصلة", "#e3b341", "اضغط لإعادة الفحص") {
+        val modTriple = makeStatCard("📡 المودمات المتصلة", "#ffb020", "#f07a0a", "اضغط لإعادة الفحص") {
             Toast.makeText(this, "جارٍ فحص جميع المودمات الآن...", Toast.LENGTH_SHORT).show()
             Shared.forceModem = true
             startMonitor()
@@ -925,18 +1031,18 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = box("#161b22", "#30363d")
+            background = grad("#ffffff", "#e8f0ff", 20)
             isClickable = true
             setOnClickListener { openLog() }
         }
         val logTexts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; layoutParams = LinearLayout.LayoutParams(0, -2, 1f) }
-        logTexts.addView(TextView(this).apply { text = "📜 سجل الراوتر (LOG)"; setTextColor(c("#8b949e")); textSize = 12f })
-        tvLogSub = TextView(this).apply { text = "جارٍ تحميل السجل..."; setTextColor(c("#e6edf3")); textSize = 13f; maxLines = 2; setPadding(0, dp(4), 0, 0) }
+        logTexts.addView(TextView(this).apply { text = "📜 سجل الراوتر (LOG)"; setTextColor(c("#64708a")); textSize = 12f })
+        tvLogSub = TextView(this).apply { text = "جارٍ تحميل السجل..."; setTextColor(c("#0f1932")); textSize = 13f; maxLines = 2; setPadding(0, dp(4), 0, 0) }
         logTexts.addView(tvLogSub)
         logCard.addView(logTexts)
         tvLogVal = TextView(this).apply {
-            text = "عرض ›"; textSize = 14f; setTypeface(null, Typeface.BOLD); setTextColor(c("#58a6ff"))
-            setPadding(dp(10), dp(6), dp(10), dp(6)); background = box("#21262d", "#30363d", 8)
+            text = "عرض ›"; textSize = 14f; setTypeface(null, Typeface.BOLD); setTextColor(c("#ffffff"))
+            setPadding(dp(12), dp(6), dp(12), dp(6)); background = grad("#1e6eff", "#0a32be", 14)
         }
         logCard.addView(tvLogVal)
         root.addView(logCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
@@ -944,7 +1050,7 @@ class MainActivity : Activity() {
         val routerCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(12), dp(14), dp(14))
-            background = box("#161b22", "#30363d")
+            background = grad(NAV1, NAV2, 22)
         }
         val routerHeader = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         routerHeader.addView(TextView(this).apply {
@@ -1013,7 +1119,7 @@ class MainActivity : Activity() {
         val ifSection = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = box("#161b22", "#30363d")
+            background = grad(NAV1, NAV2, 22)
         }
         val ifHeader = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         ifHeader.addView(TextView(this).apply {
@@ -1045,7 +1151,7 @@ class MainActivity : Activity() {
             textSize = 14f
             setTypeface(null, Typeface.BOLD)
             setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = box("#0d1117", "#58a6ff", 8)
+            background = grad("#1e6eff", "#0a32be", 16)
         }
         ifSection.addView(tvIfTotal, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
 
@@ -1099,8 +1205,10 @@ class MainActivity : Activity() {
         // enabled=false يمنع إعادة التشغيل التلقائي (بعد إعادة تشغيل الجوال أو سحب التطبيق)
         prefs.edit().putBoolean("enabled", false).commit()
         try { stopService(Intent(this, MonitorService::class.java)) } catch (e: Exception) { }
-        try { (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(1) } catch (e: Exception) { }
+        Net.reset()
+        try { (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancelAll() } catch (e: Exception) { }
         finishAndRemoveTask()
+        Handler(Looper.getMainLooper()).postDelayed({ android.os.Process.killProcess(android.os.Process.myPid()) }, 600)
     }
 
     // ---------- تحديث الواجهة من البيانات المشتركة ----------
@@ -1142,17 +1250,18 @@ class MainActivity : Activity() {
 
     private fun setBanner(t: String, col: String) {
         banner.text = t
-        banner.setTextColor(c(col))
-        banner.background = GradientDrawable().apply {
-            setColor((c(col) and 0xFFFFFF) or 0x22000000)
-            cornerRadius = dp(12).toFloat()
-            setStroke(dp(1), c(col))
+        banner.setTextColor(c("#ffffff"))
+        banner.background = when (col) {
+            "#f85149" -> grad("#ff6a5c", "#d6362a", 18)
+            "#e3b341" -> grad("#ffb020", "#f07a0a", 18)
+            "#3fb950" -> grad("#18be82", "#109664", 18)
+            else -> grad("#6b7a99", "#4a5875", 18)
         }
     }
 
     private fun renderSnap(s: Snapshot) {
         tvWanVal.text = if (s.wanUp) "متصل ✓" else "مقطوع ✗"
-        tvWanVal.setTextColor(c(if (s.wanUp) "#3fb950" else "#f85149"))
+        tvWanVal.setTextColor(c("#ffffff"))
         tvWanSub.text = "IP: ${s.ip}"
 
         val authCount = s.hosts.count { it["authorized"] == "true" }
@@ -1380,7 +1489,7 @@ class MainActivity : Activity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(10), dp(8), dp(10), dp(8))
-                background = box("#0d1117", "#21262d", 8)
+                background = if (item.disabled) grad("#5b6b8c", "#3e4c6a", 16) else if (item.running) grad("#18be82", "#109664", 16) else grad("#ff6a5c", "#c82828", 16)
                 isClickable = true
                 setOnClickListener { showInterfaceDialog(item) }
                 layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) }
@@ -1389,14 +1498,14 @@ class MainActivity : Activity() {
             val statusDot = if (item.disabled) "⚪" else if (item.running) "🟢" else "🔴"
             top.addView(TextView(this).apply {
                 text = "$statusDot ${item.name}"
-                setTextColor(c(if (item.running) "#e6edf3" else "#8b949e"))
-                textSize = 14f
+                setTextColor(c("#ffffff"))
+                textSize = 15f
                 setTypeface(null, Typeface.BOLD)
                 layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
             })
             top.addView(TextView(this).apply {
                 @Suppress("DEPRECATION")
-                text = Html.fromHtml("<font color='#3fb950'>↓ ${bw(item.rxRate)}</font> &nbsp;&nbsp; <font color='#58a6ff'>↑ ${bw(item.txRate)}</font>")
+                text = Html.fromHtml("<font color='#ffffff'>↓ ${bw(item.rxRate)}</font> &nbsp;&nbsp; <font color='#fff3c4'>↑ ${bw(item.txRate)}</font>")
                 textSize = 13f
             })
             row.addView(top)
@@ -1404,8 +1513,8 @@ class MainActivity : Activity() {
             // استهلاك هذه الواجهة منذ آخر تشغيل للراوتر
             row.addView(TextView(this).apply {
                 @Suppress("DEPRECATION")
-                text = Html.fromHtml("📊 الاستهلاك: <font color='#3fb950'>⬇ ${gbx(item.totalRx)}</font> &nbsp; <font color='#58a6ff'>⬆ ${gbx(item.totalTx)}</font> &nbsp; <font color='#e3b341'>Σ ${gbx(item.totalRx + item.totalTx)}</font>")
-                setTextColor(c("#8b949e"))
+                text = Html.fromHtml("📊 الاستهلاك: <font color='#ffffff'>⬇ ${gbx(item.totalRx)}</font> &nbsp; <font color='#fff3c4'>⬆ ${gbx(item.totalTx)}</font> &nbsp; <font color='#ffffff'>Σ ${gbx(item.totalRx + item.totalTx)}</font>")
+                setTextColor(c("#e6f6ee"))
                 textSize = 12f
                 setPadding(0, dp(4), 0, 0)
             })
@@ -1417,7 +1526,7 @@ class MainActivity : Activity() {
                 val miniBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
                     max = 100
                     progress = barPercent
-                    progressDrawable = makeProgressDrawable("#238636")
+                    progressDrawable = makeProgressDrawable("#ffffff")
                     layoutParams = LinearLayout.LayoutParams(-1, dp(4)).apply { topMargin = dp(6) }
                 }
                 row.addView(miniBar)
@@ -1436,21 +1545,22 @@ class MainActivity : Activity() {
         when {
             Shared.logError != null -> {
                 tvLogSub.text = "⚠️ لا يمكن قراءة السجل: ${Shared.logError}\n(أعطِ مستخدم API صلاحية read)"
-                tvLogSub.setTextColor(c("#e3b341"))
+                tvLogSub.setTextColor(c("#c26a00"))
             }
-            !Shared.logsReady -> { tvLogSub.text = "جارٍ تحميل السجل..."; tvLogSub.setTextColor(c("#8b949e")) }
+            !Shared.logsReady -> { tvLogSub.text = "جارٍ تحميل السجل..."; tvLogSub.setTextColor(c("#64708a")) }
             unread > 0 && lastRed != null -> {
                 tvLogSub.text = "🔴 $unread أخطاء جديدة • ${lastRed.time}  ${lastRed.msg}"
-                tvLogSub.setTextColor(c("#f85149"))
+                tvLogSub.setTextColor(c("#d6362a"))
             }
             else -> {
                 tvLogSub.text = "✅ لا توجد أخطاء جديدة • ${logs.size} سطر — اضغط لعرض السجل كاملاً"
-                tvLogSub.setTextColor(c("#e6edf3"))
+                tvLogSub.setTextColor(c("#0f7a50"))
             }
         }
         tvLogVal.text = if (unread > 0) "🔴 $unread" else "عرض ›"
-        tvLogVal.setTextColor(c(if (unread > 0) "#f85149" else "#58a6ff"))
-        logCard.background = box("#161b22", if (unread > 0) "#f85149" else "#30363d")
+        tvLogVal.setTextColor(c("#ffffff"))
+        tvLogVal.background = if (unread > 0) grad("#ff6a5c", "#d6362a", 14) else grad("#1e6eff", "#0a32be", 14)
+        logCard.background = if (unread > 0) grad("#fff1ef", "#ffd9d4", 20) else grad("#ffffff", "#e8f0ff", 20)
     }
 
     private fun openLog() {
@@ -1568,7 +1678,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(10), dp(8), dp(10), dp(8))
-                background = box("#0d1117", if (m.up) "#21262d" else "#f85149", 8)
+                background = if (m.up) grad("#18be82", "#109664", 16) else grad("#ff6a5c", "#c82828", 16)
                 isClickable = true
                 setOnClickListener { pingDialog(m.ip, "فحص المودم: ${m.name} (${m.ip})") }
                 layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) }
@@ -1582,9 +1692,9 @@ class MainActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
             })
             val statusTxt = if (m.up) {
-                "<font color='#3fb950'>متصل (${m.ip})</font>"
+                "<font color='#ffffff'>متصل (${m.ip})</font>"
             } else {
-                "<font color='#f85149'>مقطوع منذ ${ago(m.downSince ?: System.currentTimeMillis())}</font>"
+                "<font color='#ffffff'>مقطوع منذ ${ago(m.downSince ?: System.currentTimeMillis())}</font>"
             }
             row.addView(TextView(this).apply {
                 @Suppress("DEPRECATION")
@@ -1617,13 +1727,12 @@ class MainActivity : Activity() {
     private fun toggleInterface(ifName: String, disable: Boolean) {
         Thread {
             try {
-                val r = rosConnect(prefs)
+                val r = Net.get(prefs)
                 val id = r.cmd("/interface/print", "?name=$ifName").firstOrNull()?.get(".id")
                 if (id != null) {
                     r.cmd("/interface/set", "=.id=$id", "=disabled=${if (disable) "yes" else "no"}")
                     runOnUiThread { Toast.makeText(this, "تم تحديث حالة $ifName بنجاح", Toast.LENGTH_SHORT).show() }
                 }
-                r.close()
             } catch (e: Exception) {
                 runOnUiThread { Toast.makeText(this, "خطأ: ${e.message}", Toast.LENGTH_LONG).show() }
             }
@@ -1633,7 +1742,7 @@ class MainActivity : Activity() {
     private fun restartInterface(ifName: String) {
         Thread {
             try {
-                val r = rosConnect(prefs)
+                val r = Net.get(prefs)
                 val id = r.cmd("/interface/print", "?name=$ifName").firstOrNull()?.get(".id")
                 if (id != null) {
                     r.cmd("/interface/set", "=.id=$id", "=disabled=yes")
@@ -1641,7 +1750,6 @@ class MainActivity : Activity() {
                     r.cmd("/interface/set", "=.id=$id", "=disabled=no")
                     runOnUiThread { Toast.makeText(this, "تم إعادة تشغيل المنفذ $ifName", Toast.LENGTH_SHORT).show() }
                 }
-                r.close()
             } catch (e: Exception) {
                 runOnUiThread { Toast.makeText(this, "خطأ: ${e.message}", Toast.LENGTH_LONG).show() }
             }
@@ -1660,9 +1768,8 @@ class MainActivity : Activity() {
     private fun kickUser(path: String, id: String, name: String) {
         Thread {
             try {
-                val r = rosConnect(prefs)
+                val r = Net.get(prefs)
                 r.cmd(path, "=.id=$id")
-                r.close()
                 runOnUiThread { Toast.makeText(this, "تم فصل المتصل ($name) بنجاح", Toast.LENGTH_SHORT).show() }
             } catch (e: Exception) {
                 runOnUiThread { Toast.makeText(this, "تعذر الفصل: ${e.message}", Toast.LENGTH_LONG).show() }
@@ -1674,9 +1781,8 @@ class MainActivity : Activity() {
         val pd = AlertDialog.Builder(this).setTitle(title).setMessage("جارٍ إرسال 4 نبضات Ping إلى $address...").show()
         Thread {
             try {
-                val r = rosConnect(prefs)
+                val r = Net.get(prefs)
                 val res = r.cmd("/ping", "=address=$address", "=count=4")
-                r.close()
                 val sb = StringBuilder()
                 var okCount = 0
                 for ((idx, row) in res.withIndex()) {
@@ -1710,9 +1816,8 @@ class MainActivity : Activity() {
             .setPositiveButton("نعم، أعد التشغيل") { _, _ ->
                 Thread {
                     try {
-                        val r = rosConnect(prefs)
+                        val r = Net.get(prefs)
                         r.cmd("/system/reboot")
-                        r.close()
                     } catch (e: Exception) { }
                     runOnUiThread { Toast.makeText(this, "تم إرسال أمر إعادة التشغيل للراوتر", Toast.LENGTH_LONG).show() }
                 }.start()

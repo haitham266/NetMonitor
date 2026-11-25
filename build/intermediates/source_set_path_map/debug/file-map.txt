@@ -1,0 +1,8 @@
+net.netmonitor.app-pngs-0 /tmp/NetMonitor/build/generated/res/pngs/debug
+net.netmonitor.app-resValues-1 /tmp/NetMonitor/build/generated/res/resValues/debug
+net.netmonitor.app-packageDebugResources-2 /tmp/NetMonitor/build/intermediates/incremental/debug/packageDebugResources/merged.dir
+net.netmonitor.app-packageDebugResources-3 /tmp/NetMonitor/build/intermediates/incremental/debug/packageDebugResources/stripped.dir
+net.netmonitor.app-merged_res-4 /tmp/NetMonitor/build/intermediates/merged_res/debug
+net.netmonitor.app-NetMonitor-5 /tmp/NetMonitor/res
+net.netmonitor.app-debug-6 /tmp/NetMonitor/src/debug/res
+net.netmonitor.app-main-7 /tmp/NetMonitor/src/main/res
