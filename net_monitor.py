@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-مراقب الشبكة — نسخة اللابتوب (ويندوز)
+Net Microtik Monitor — نسخة اللابتوب (ويندوز)
 نفس منطق تطبيق الأندرويد: مراقبة لحظية مستمرة بالخلفية للميكروتيك عبر API،
 HOST / ACTIVE مع استهلاك كل مستخدم، المودمات، الواجهات ومجموع الاستهلاك،
 وتنبيهات ويندوز عند انقطاع الإنترنت أو أي مودم.
@@ -22,7 +22,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-APP_NAME = "مراقب الشبكة"
+APP_NAME = "Net Microtik Monitor"
 PORT = 8766
 IS_WIN = os.name == "nt"
 CFG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "NetMonitor")
@@ -80,18 +80,48 @@ class Trap(Exception):
     pass
 
 
+class _Call:
+    def __init__(self, on_re=None):
+        self.on_re = on_re
+        self.rows = []
+        self.err = None
+        self.fatal = None
+        self.ret = None
+        self.ev = threading.Event()
+
+
 class Ros:
+    """اتصال API واحد مشترك: كل الأوامر على نفس الجلسة بوسوم .tag (بدون تسجيل دخول متكرر)."""
+
     def __init__(self, host, port, timeout):
         self.s = socket.create_connection((host, port), timeout=timeout)
         self.s.settimeout(15)
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        self.lock = threading.Lock()
+        try:
+            self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        self.dead = False
+        self.wlock = threading.Lock()
+        self.calls = {}
+        self.clock = threading.Lock()
+        self.seq = 0
 
     def close(self):
+        self.dead = True
         try:
             self.s.close()
         except Exception:
             pass
+        self._fail_all(IOError("انقطع الاتصال بالراوتر"))
+
+    def _fail_all(self, e):
+        with self.clock:
+            cs = list(self.calls.values())
+            self.calls.clear()
+        for c in cs:
+            c.fatal = e
+            c.ev.set()
 
     @staticmethod
     def enc_len(n):
@@ -114,9 +144,6 @@ class Ros:
             buf += ch
         return buf
 
-    def _rlen(self):
-        return self._rlen_from(self._recv(1)[0])
-
     def _rlen_from(self, c):
         if c & 0x80 == 0:
             return c
@@ -128,23 +155,10 @@ class Ros:
             return ((c & 0x0F) << 24) | int.from_bytes(self._recv(3), "big")
         return int.from_bytes(self._recv(4), "big")
 
-    def _sentence(self, idle_ok=False):
+    def _sentence(self):
         words = []
-        first = True
         while True:
-            if first:
-                first = False
-                try:
-                    c = self.s.recv(1)
-                except (socket.timeout, TimeoutError):
-                    if idle_ok:
-                        return None
-                    raise
-                if not c:
-                    raise IOError("انقطع الاتصال بالراوتر")
-                n = self._rlen_from(c[0])
-            else:
-                n = self._rlen()
+            n = self._rlen_from(self._recv(1)[0])
             if n == 0:
                 return words
             words.append(self._recv(n).decode("utf-8", "replace"))
@@ -164,56 +178,117 @@ class Ros:
         for w in words:
             b = w.encode("utf-8")
             data += self.enc_len(len(b)) + b
-        self.s.sendall(data + b"\x00")
+        with self.wlock:
+            self.s.sendall(data + b"\x00")
 
-    def stream(self, words, stop, on_idle, on_re):
-        """بث مستمر (مثل /log/print follow-only)."""
-        with self.lock:
-            self._send(words)
-            err = None
-            while True:
-                if stop():
-                    raise IOError("stop")
-                sn = self._sentence(idle_ok=True)
-                if sn is None:
-                    on_idle()
-                    continue
-                if not sn:
-                    continue
-                t = sn[0]
-                if t == "!re":
-                    on_re(self._attrs(sn))
-                elif t == "!trap":
-                    err = self._attrs(sn).get("message", "error")
-                elif t == "!fatal":
-                    raise IOError("fatal")
-                elif t == "!done":
-                    if err is not None:
-                        raise Trap(err)
-                    return
+    def login(self, user, pw):
+        self._send(["/login", "=name=" + user, "=password=" + pw])
+        err = None
+        while True:
+            sn = self._sentence()
+            if not sn:
+                continue
+            if sn[0] == "!trap":
+                err = self._attrs(sn).get("message", "error")
+            elif sn[0] == "!fatal":
+                raise IOError("fatal")
+            elif sn[0] == "!done":
+                if err is not None:
+                    raise Trap(err)
+                break
+        self.s.settimeout(None)
+        threading.Thread(target=self._read_loop, daemon=True).start()
 
-    def cmd(self, *words):
-        with self.lock:
-            self._send(words)
-            res, err = [], None
-            while True:
+    def _read_loop(self):
+        try:
+            while not self.dead:
                 sn = self._sentence()
                 if not sn:
                     continue
+                tag = None
+                for w in sn:
+                    if w.startswith(".tag="):
+                        tag = w[5:]
+                        break
+                c = self.calls.get(tag) if tag is not None else None
+                if c is None:
+                    continue
                 t = sn[0]
                 if t == "!re":
-                    res.append(self._attrs(sn))
+                    a = self._attrs(sn)
+                    if c.on_re:
+                        c.on_re(a)
+                    else:
+                        c.rows.append(a)
                 elif t == "!trap":
-                    err = self._attrs(sn).get("message", "error")
+                    c.err = self._attrs(sn).get("message", "error")
                 elif t == "!fatal":
-                    raise IOError("fatal")
+                    c.fatal = IOError("fatal")
+                    self.calls.pop(tag, None)
+                    c.ev.set()
                 elif t == "!done":
-                    if err is not None:
-                        raise Trap(err)
-                    ret = self._attrs(sn).get("ret")
-                    if ret is not None and not res:
-                        res.append({"ret": ret})
-                    return res
+                    c.ret = self._attrs(sn).get("ret")
+                    self.calls.pop(tag, None)
+                    c.ev.set()
+        except Exception as e:
+            self.dead = True
+            try:
+                self.s.close()
+            except Exception:
+                pass
+            self._fail_all(e if isinstance(e, IOError) else IOError(str(e)))
+
+    def _start(self, words, on_re=None):
+        if self.dead:
+            raise IOError("انقطع الاتصال بالراوتر")
+        with self.clock:
+            self.seq += 1
+            tag = str(self.seq)
+            c = _Call(on_re)
+            self.calls[tag] = c
+        try:
+            self._send(list(words) + [".tag=" + tag])
+        except Exception:
+            self.calls.pop(tag, None)
+            self.close()
+            raise
+        return tag, c
+
+    def cmd(self, *words):
+        tag, c = self._start(words)
+        if not c.ev.wait(20):
+            self.calls.pop(tag, None)
+            self.close()
+            raise IOError("انتهت مهلة الراوتر")
+        if c.fatal:
+            raise c.fatal
+        if c.err is not None:
+            raise Trap(c.err)
+        res = list(c.rows)
+        if c.ret is not None and not res:
+            res.append({"ret": c.ret})
+        return res
+
+    def stream(self, words, stop, on_idle, on_re):
+        """بث مستمر (مثل /log/print follow-only) على نفس الاتصال."""
+        tag, c = self._start(words, on_re)
+        try:
+            while True:
+                if stop():
+                    try:
+                        self._send(["/cancel", "=tag=" + tag])
+                    except Exception:
+                        pass
+                    raise IOError("stop")
+                if c.ev.wait(3):
+                    break
+                on_idle()
+        finally:
+            self.calls.pop(tag, None)
+        if c.fatal:
+            raise c.fatal
+        if c.err is not None and c.err != "interrupted":
+            raise Trap(c.err)
 
 
 def friendly(e):
@@ -242,7 +317,7 @@ def ros_connect(c, set_via=True):
         r = None
         try:
             r = Ros(host, port, timeout)
-            r.cmd("/login", "=name=" + c.get("user", ""), "=password=" + c.get("pass", ""))
+            r.login(c.get("user", ""), c.get("pass", ""))
             if set_via:
                 S["via"] = "محلي LAN" if key == "local" else "كلاود Cloud"
             return r
@@ -251,6 +326,47 @@ def ros_connect(c, set_via=True):
                 r.close()
             last = e
     raise last
+
+
+class _Net:
+    """جلسة واحدة فقط مع الراوتر يستخدمها الجميع."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cur = None
+        self.fail_at = 0.0
+        self.fail_err = None
+
+    def get(self, c, set_via=True):
+        with self.lock:
+            r = self.cur
+            if r is not None and not r.dead:
+                return r
+            if self.fail_err is not None and time.time() - self.fail_at < 2.5:
+                raise self.fail_err
+            try:
+                r = ros_connect(c, set_via=True)
+                self.cur, self.fail_err = r, None
+                return r
+            except Exception as e:
+                self.fail_err, self.fail_at = e, time.time()
+                raise
+
+    def drop(self, r):
+        with self.lock:
+            if r is not None:
+                r.close()
+            if self.cur is r or (self.cur is not None and self.cur.dead):
+                self.cur = None
+
+    def reset(self):
+        with self.lock:
+            if self.cur is not None:
+                self.cur.close()
+            self.cur, self.fail_err = None, None
+
+
+Net = _Net()
 
 
 # ======================= أدوات =======================
@@ -356,8 +472,7 @@ def main_loop():
     ros, gen, prev_if, was_wan = None, S["gen"], {}, None
     while not STOP.is_set():
         if gen != S["gen"]:
-            if ros:
-                ros.close()
+            Net.reset()
             ros, gen, was_wan = None, S["gen"], None
             prev_if.clear()
         c = load_cfg()
@@ -366,7 +481,7 @@ def main_loop():
             STOP.wait(1)
             continue
         try:
-            r = ros or ros_connect(c)
+            r = Net.get(c)
             ros = r
             res = (r.cmd("/system/resource/print") or [{}])[0]
             hl = {}
@@ -439,26 +554,19 @@ def main_loop():
                 alert("🟢 عاد الإنترنت" if wan_up else "🔴 انقطع الإنترنت", "الواجهة: " + wan)
             was_wan = wan_up
         except Exception as e:
-            if ros:
-                ros.close()
+            if not isinstance(e, Trap):
+                Net.drop(ros)
             ros = None
             S["error"] = friendly(e)
         STOP.wait(2)
-    if ros:
-        ros.close()
 
 
 # ======================= حلقة المودمات (كل ~3 ثواني، 5 اتصالات متوازية) =======================
 def modem_loop():
-    conns = [None] * 5
     gen, last_down, first = S["gen"], set(), True
     down_since = {}
     while not STOP.is_set():
         if gen != S["gen"]:
-            for i, cn in enumerate(conns):
-                if cn:
-                    cn.close()
-                conns[i] = None
             gen, first, last_down = S["gen"], True, set()
         FORCE.clear()
         c = load_cfg()
@@ -469,24 +577,22 @@ def modem_loop():
             continue
 
         prev = {m["ip"]: m for m in S["modems"]}
-        workers = min(len(lst), len(conns))
+        workers = min(len(lst), 5)
         results = [None] * len(lst)
 
         def work(w):
             i = w
             while i < len(lst):
                 name, mip = lst[i]
+                cn = None
                 try:
-                    if conns[w] is None:
-                        conns[w] = ros_connect(c, set_via=False)
-                    rows = conns[w].cmd("/ping", "=address=" + mip, "=count=2", "=interval=0.5")
+                    cn = Net.get(c, set_via=False)
+                    rows = cn.cmd("/ping", "=address=" + mip, "=count=2", "=interval=0.5")
                     up = any(r.get("received", "0") != "0" or "time" in r for r in rows)
                 except Trap:
                     up = False
                 except Exception:
-                    if conns[w]:
-                        conns[w].close()
-                    conns[w] = None
+                    Net.drop(cn)
                     up = None
                 old = prev.get(mip)
                 if up is None:
@@ -518,9 +624,6 @@ def modem_loop():
                 alert("🟢 عاد الاتصال", "، ".join(back))
         last_down, first = now_down, False
         FORCE.wait(3)
-    for cn in conns:
-        if cn:
-            cn.close()
 
 
 # ======================= سجل الراوتر: بث لحظي + تنبيه للأحمر =======================
@@ -589,7 +692,7 @@ def log_loop():
                 st["last"] = now
 
         try:
-            r = ros_connect(c, set_via=False)
+            r = Net.get(c, set_via=False)
             first = not S["logsReady"]
             init = [to_log(m) for m in r.cmd("/log/print", "=.proplist=.id,time,topics,message")]
             init = [e for e in init if e]
@@ -604,7 +707,6 @@ def log_loop():
                 S["logVer"] += 1
             flush(True)
 
-            r.s.settimeout(3)
             gen = my_gen
 
             def on_idle():
@@ -617,18 +719,20 @@ def log_loop():
                 flush()
 
             r.stream(["/log/print", "=follow-only=", "=.proplist=.id,time,topics,message"],
-                     lambda: STOP.is_set() or gen != S["gen"] or st["idle"] > 300, on_idle, on_re)
+                     lambda: STOP.is_set() or gen != S["gen"], on_idle, on_re)
         except Trap as e:
             with S_LOCK:
                 S["logError"] = str(e)
                 S["logVer"] += 1
             wait = 15
         except Exception as e:
-            wait = 0.2 if str(e) == "stop" else 5
+            if str(e) == "stop":
+                wait = 0.2
+            else:
+                wait = 5
+                Net.drop(r)
         finally:
             flush(True)
-            if r:
-                r.close()
         STOP.wait(wait)
 
 
@@ -643,11 +747,12 @@ def do_action(body):
         return {"ok": True}
     if t == "quit":
         STOP.set()
+        Net.reset()
         threading.Timer(0.6, lambda: os._exit(0)).start()
         return {"ok": True}
 
     c = load_cfg()
-    r = ros_connect(c, set_via=False)
+    r = Net.get(c, set_via=False)
     try:
         if t == "kick":
             path = "/ip/hotspot/host/remove" if body.get("mode") == "host" else "/ip/hotspot/active/remove"
@@ -685,7 +790,7 @@ def do_action(body):
             return {"ok": True, "msg": "تم إرسال أمر إعادة التشغيل للراوتر"}
         return {"ok": False, "msg": "أمر غير معروف"}
     finally:
-        r.close()
+        pass
 
 
 # ======================= خادم الواجهة المحلي =======================
@@ -872,7 +977,7 @@ HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>مراقب الشبكة</title>
+<title>Net Microtik Monitor</title>
 <style>
 :root{--bg:#0d1117;--card:#161b22;--inner:#0d1117;--chip:#21262d;--line:#30363d;--line2:#21262d;--text:#e6edf3;--sub:#8b949e;--mute:#6e7681;--blue:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#e3b341;--purple:#a371f7}
 *{box-sizing:border-box}
@@ -955,12 +1060,51 @@ tr.lv1 td.msg{color:var(--yellow)}
 td.msg{white-space:normal;unicode-bidi:plaintext;text-align:start;line-height:1.6}
 pre{white-space:pre-wrap;font:inherit;margin:0;line-height:1.9}
 @media (max-width:1050px){.cols{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}}
+
+/* ===== مظهر Net Microtik Monitor: بطاقات ملونة بتدرجات ===== */
+html,body{background:#EEF3FB;color:#0f1932}
+header h1{color:#0f1932}
+.btn{background:linear-gradient(135deg,#fff,#dfe8f8);border:1px solid #cfdaf0;color:#0f1932;border-radius:14px}
+.btn:hover{border-color:#1e6eff}
+.btn.red{color:#d6362a;border-color:#f3b4ae}
+.btn.primary{background:linear-gradient(135deg,#1e6eff,#0a32be);border-color:#1e6eff;color:#fff}
+#banner{color:#fff;border:0;border-radius:18px;background:linear-gradient(135deg,#6b7a99,#4a5875)}
+.stat{border:0;border-radius:20px;color:#fff}
+.stat .t,.stat .s{color:#eef3ff}
+.stat .v{color:#fff!important;font-size:32px}
+.stats .stat:nth-child(1){background:linear-gradient(135deg,#18be82,#109664)}
+.stats .stat:nth-child(2){background:linear-gradient(135deg,#14aac8,#0a6eaa)}
+.stats .stat:nth-child(3){background:linear-gradient(135deg,#e65a96,#be326e)}
+.stats .stat:nth-child(4){background:linear-gradient(135deg,#ffb020,#f07a0a)}
+.stat:hover{filter:brightness(1.06);border:0}
+.card{border:0;border-radius:22px;background:linear-gradient(135deg,#1a2c50,#121f3c);color:#e6edf3}
+.mod .st span[style]{color:#ffe3e0!important}
+.stat.card{border-radius:20px}
+.chip{border-radius:12px}
+.logc{background:linear-gradient(135deg,#fff,#e8f0ff)!important;color:#0f1932}
+.logc .lt .t{color:#64708a}
+.logc .lt .m span.g{color:#0f7a50}
+.logc.hot{background:linear-gradient(135deg,#fff1ef,#ffd9d4)!important;border:0}
+.logc .chip.b{background:linear-gradient(135deg,#1e6eff,#0a32be);color:#fff;border:0}
+.logc .chip.r{background:linear-gradient(135deg,#ff6a5c,#d6362a);color:#fff;border:0}
+.mod{border:0;border-radius:16px;color:#fff;background:linear-gradient(135deg,#18be82,#109664)}
+.mod.down{background:linear-gradient(135deg,#ff6a5c,#c82828)}
+.mod .st,.mod .st.g,.mod .st.r{color:#fff}
+.total{border:0;border-radius:16px;background:linear-gradient(135deg,#1e6eff,#0a32be);color:#fff}
+.total .big{color:#fff}.total .sm,.total .sm .g,.total .sm .b,.total .sm .y{color:#e6eeff}
+.ifr{border:0;border-radius:16px;color:#fff;background:linear-gradient(135deg,#18be82,#109664)}
+.ifr.off{background:linear-gradient(135deg,#ff6a5c,#c82828)}
+.ifr.off .nm{color:#fff}
+.ifr .g,.ifr .b,.ifr .y,.ifr .use{color:#fff}.ifr .rates .b{color:#fff3c4}
+.ifr .bar{background:rgba(255,255,255,.25)}
+.ifr .bar>i{background:#fff!important}
+.mod:hover,.ifr:hover{filter:brightness(1.06)}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1 id="title">📡 مراقب الشبكة</h1>
+    <h1 id="title">📡 Net Microtik Monitor</h1>
     <button class="btn" onclick="refreshNow()">🔄 تحديث</button>
     <button class="btn" onclick="openSettings()">⚙️ الإعدادات</button>
     <button class="btn red" onclick="quitApp()">⏻ إيقاف</button>
@@ -1032,7 +1176,8 @@ async function poll(){
 
 function setBanner(t,col){
   const b=$('banner'); if(b.textContent===t) return;
-  b.textContent=t; b.style.color=col; b.style.borderColor=col; b.style.background=col+'22';
+  b.textContent=t; b.style.color='#fff'; b.style.border='0';
+  b.style.background={'#f85149':'linear-gradient(135deg,#ff6a5c,#d6362a)','#e3b341':'linear-gradient(135deg,#ffb020,#f07a0a)','#3fb950':'linear-gradient(135deg,#18be82,#109664)','#58a6ff':'linear-gradient(135deg,#1e6eff,#0a32be)'}[col]||'linear-gradient(135deg,#6b7a99,#4a5875)';
 }
 
 function render(){

@@ -1,5 +1,5 @@
-﻿; ملف التثبيت — مراقب الشبكة (Inno Setup 6)
-#define AppName "مراقب الشبكة"
+﻿; ملف التثبيت — Net Microtik Monitor (Inno Setup 6)
+#define AppName "Net Microtik Monitor"
 #define AppExe "NetMonitor.exe"
 #define AppVer "1.0"
 
