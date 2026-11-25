@@ -358,7 +358,7 @@ object Routers {
             val a = org.json.JSONArray(sp(ctx).getString("list", "[]"))
             for (i in 0 until a.length()) {
                 val o = a.getJSONObject(i)
-                out.add(RouterCfg(o.getString("id"), o.optString("name"), o.optString("local"), o.optString("cloud"),
+                out.add(RouterCfg(o.getString("id"), o.optString("name"), o.optString("local").ifBlank { o.optString("cloud") }, if (o.optString("local").isBlank()) "" else o.optString("cloud"),
                     o.optString("port", "8728"), o.optString("user"), o.optString("pass"), o.optString("wan", "ether1"), o.optString("modems"), o.optBoolean("nErr", true), o.optBoolean("nWarn", false)))
             }
         } catch (e: Exception) { }
@@ -2284,14 +2284,12 @@ class MainActivity : Activity() {
         val (root, _) = pageShell(if (old == null) "➕ إضافة راوتر" else "✏️ تعديل الراوتر") { d.dismiss() }
         fun ed(v: String, hint: String, pwd: Boolean = false) = EditText(this).apply { setText(v); this.hint = hint; isSingleLine = true; if (pwd) inputType = 129 }
         val eName = ed(old?.name ?: "", "شبكة النور")
-        val eLocal = ed(old?.local ?: "", "192.168.88.1")
-        val eCloud = ed(old?.cloud ?: "", "xxxx.sn.mynetname.net")
+        val eLocal = ed((old?.local ?: "").ifBlank { old?.cloud ?: "" }, "192.168.88.1 أو xxxx.sn.mynetname.net")
         val eUser = ed(old?.user ?: "", "admin")
         val ePass = ed(old?.pass ?: "", "", true)
         val ePort = ed(old?.port ?: "8728", "8728")
         addRow(root, lbl("🏷️ اسم الراوتر", eName))
-        addRow(root, lbl("عنوان الراوتر (IP أو DNS)", eLocal))
-        addRow(root, lbl("عنوان الكلاود (اختياري)", eCloud))
+        addRow(root, lbl("عنوان الراوتر (IP أو كلاود DNS)", eLocal))
         addRow(root, lbl("اسم المستخدم", eUser), lbl("منفذ API", ePort), weights = floatArrayOf(2f, 1f))
         addRow(root, lbl("كلمة المرور", ePass))
         val cbRemember = CheckBox(this).apply { text = "🔐 حفظ بيانات الدخول"; textSize = 14f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("remember", true) }
@@ -2300,7 +2298,7 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
         d = fullDialog(root)
         saveButtons(root, d, "حفظ") {
-            val local = eLocal.text.toString().trim(); val cloud = eCloud.text.toString().trim()
+            val local = eLocal.text.toString().trim(); val cloud = if (old?.local.isNullOrBlank()) "" else (old?.cloud ?: "")
             if (local.isEmpty() && cloud.isEmpty() || eUser.text.isNullOrBlank()) {
                 Toast.makeText(this, "أدخل العنوان واسم المستخدم", Toast.LENGTH_LONG).show(); return@saveButtons
             }
