@@ -1,0 +1,8 @@
+<resources>
+    <style name="NMDialog" parent="@android:style/Theme.DeviceDefault.Light.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/dlg_bg</item>
+        <item name="android:colorAccent">#1E6EFF</item>
+        <item name="android:textColorPrimary">#1F2A44</item>
+        <item name="android:textColorSecondary">#64708A</item>
+    </style>
+</resources>

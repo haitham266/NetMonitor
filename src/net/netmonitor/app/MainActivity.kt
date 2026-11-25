@@ -1191,7 +1191,7 @@ class MainActivity : Activity() {
     override fun onBackPressed() = confirmExit()
 
     private fun confirmExit() {
-        AlertDialog.Builder(this)
+        AlertDialog.Builder(this, R.style.NMDialog)
             .setTitle("الخروج من التطبيق")
             .setMessage("خروج نهائي: يوقف المراقبة والتنبيهات تماماً حتى تفتح التطبيق مرة أخرى.\n\nتشغيل بالخلفية: يغلق الواجهة وتستمر المراقبة والتنبيهات.")
             .setPositiveButton("⏻ خروج نهائي") { _, _ -> exitCompletely() }
@@ -1300,7 +1300,7 @@ class MainActivity : Activity() {
     private fun note(container: LinearLayout, msg: String) {
         container.addView(TextView(this).apply {
             text = msg
-            setTextColor(c("#8b949e"))
+            setTextColor(c("#64708a"))
             setPadding(0, dp(6), 0, dp(6))
         })
     }
@@ -1313,12 +1313,12 @@ class MainActivity : Activity() {
         val wrap = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(12), dp(12), dp(12))
-            setBackgroundColor(c("#0d1117"))
+            setBackgroundColor(c("#EEF3FB"))
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
-        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(14), dp(10), dp(10), dp(10)); background = grad(NAV1, NAV2, 22) }
         val title = TextView(this).apply {
-            setTextColor(c(if (isHost) "#3fb950" else "#a371f7"))
+            setTextColor(c("#ffffff"))
             textSize = 18f
             setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
@@ -1326,22 +1326,22 @@ class MainActivity : Activity() {
         head.addView(title)
         head.addView(TextView(this).apply {
             text = "✖ إغلاق"
-            setTextColor(c("#e6edf3"))
+            setTextColor(c("#ffffff"))
             textSize = 13f
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            background = box("#21262d", "#30363d", 8)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = grad("#1e6eff", "#0a32be", 14)
             setOnClickListener { d.dismiss() }
         })
         wrap.addView(head)
 
         val search = EditText(this).apply {
             hint = if (isHost) "🔍 بحث بالماك أو IP" else "🔍 بحث باسم المستخدم أو IP"
-            setHintTextColor(c("#6e7681"))
-            setTextColor(c("#e6edf3"))
+            setHintTextColor(c("#8a94ab"))
+            setTextColor(c("#1f2a44"))
             isSingleLine = true
             textSize = 14f
             setPadding(dp(12), dp(8), dp(12), dp(8))
-            background = box("#161b22", "#30363d", 8)
+            background = box("#ffffff", "#c9d6ee", 14)
             addTextChangedListener(object : android.text.TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, cnt: Int) {}
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, cnt: Int) {}
@@ -1420,7 +1420,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(10), dp(8), dp(10), dp(8))
-                background = box("#161b22", "#21262d", 8)
+                background = grad("#ffffff", "#e8f0ff", 16)
                 isClickable = true
                 setOnClickListener { confirmKick(path, id, nm) }
                 layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) }
@@ -1431,27 +1431,27 @@ class MainActivity : Activity() {
             }
             info.addView(TextView(this).apply {
                 text = "${if (isHost) "💻" else "👤"} $nm"
-                setTextColor(c("#e6edf3"))
+                setTextColor(c("#1f2a44"))
                 textSize = 14f
                 setTypeface(null, Typeface.BOLD)
             })
             info.addView(TextView(this).apply {
                 text = "IP: $ip | ⏱ $up$st"
-                setTextColor(c("#8b949e"))
+                setTextColor(c("#64708a"))
                 textSize = 12f
             })
             info.addView(TextView(this).apply {
                 @Suppress("DEPRECATION")
-                text = Html.fromHtml("<font color='#3fb950'>⬇ ${gb(dl)}</font> &nbsp; <font color='#58a6ff'>⬆ ${gb(ul)}</font> &nbsp; <font color='#e3b341'>Σ ${gb(dl + ul)}</font>")
+                text = Html.fromHtml("<font color='#0f7a50'>⬇ ${gb(dl)}</font> &nbsp; <font color='#1e6eff'>⬆ ${gb(ul)}</font> &nbsp; <font color='#b07800'>Σ ${gb(dl + ul)}</font>")
                 textSize = 13f
             })
             row.addView(info)
             row.addView(TextView(this).apply {
                 text = if (isHost) "حذف ❌" else "طرد ❌"
-                setTextColor(c("#f85149"))
+                setTextColor(c("#ffffff"))
                 textSize = 12f
-                setPadding(dp(8), dp(4), dp(8), dp(4))
-                background = box("#21262d", "#f85149", 6)
+                setPadding(dp(10), dp(5), dp(10), dp(5))
+                background = grad("#ff6a5c", "#d6362a", 12)
             })
             container.addView(row)
             shown++
@@ -1536,7 +1536,7 @@ class MainActivity : Activity() {
     }
 
     // ---------- سجل الراوتر ----------
-    private fun logColor(lvl: Int) = when (lvl) { 2 -> "#f85149"; 1 -> "#e3b341"; else -> "#c9d1d9" }
+    private fun logColor(lvl: Int) = when (lvl) { 2 -> "#d6362a"; 1 -> "#9a6a00"; else -> "#1f2a44" }
 
     private fun renderLogCard() {
         val logs = Shared.logs
@@ -1572,18 +1572,18 @@ class MainActivity : Activity() {
         val wrap = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(12), dp(12), dp(12))
-            setBackgroundColor(c("#0d1117"))
+            setBackgroundColor(c("#EEF3FB"))
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
-        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(14), dp(10), dp(10), dp(10)); background = grad(NAV1, NAV2, 22) }
         val title = TextView(this).apply {
-            text = "📜 سجل الراوتر"; setTextColor(c("#58a6ff")); textSize = 18f; setTypeface(null, Typeface.BOLD)
+            text = "📜 سجل الراوتر"; setTextColor(c("#ffffff")); textSize = 18f; setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
         head.addView(title)
         head.addView(TextView(this).apply {
-            text = "✖ إغلاق"; setTextColor(c("#e6edf3")); textSize = 13f
-            setPadding(dp(10), dp(6), dp(10), dp(6)); background = box("#21262d", "#30363d", 8)
+            text = "✖ إغلاق"; setTextColor(c("#ffffff")); textSize = 13f
+            setPadding(dp(12), dp(6), dp(12), dp(6)); background = grad("#1e6eff", "#0a32be", 14)
             setOnClickListener { d.dismiss() }
         })
         wrap.addView(head)
@@ -1602,8 +1602,8 @@ class MainActivity : Activity() {
 
         wrap.addView(EditText(this).apply {
             hint = "🔍 بحث في السجل"
-            setHintTextColor(c("#6e7681")); setTextColor(c("#e6edf3")); isSingleLine = true; textSize = 14f
-            setPadding(dp(12), dp(8), dp(12), dp(8)); background = box("#161b22", "#30363d", 8)
+            setHintTextColor(c("#8a94ab")); setTextColor(c("#1f2a44")); isSingleLine = true; textSize = 14f
+            setPadding(dp(12), dp(8), dp(12), dp(8)); background = box("#ffffff", "#c9d6ee", 14)
             addTextChangedListener(object : android.text.TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, cnt: Int) {}
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, cnt: Int) {}
@@ -1625,8 +1625,8 @@ class MainActivity : Activity() {
         val cont = logContainer ?: return
         for (ch in logChips) {
             val on = ch.tag == logFilter
-            ch.setTextColor(c(if (on) "#0d1117" else "#e6edf3"))
-            ch.background = box(if (on) "#58a6ff" else "#21262d", if (on) "#58a6ff" else "#30363d", 8)
+            ch.setTextColor(c(if (on) "#ffffff" else "#1f2a44"))
+            ch.background = if (on) grad("#1e6eff", "#0a32be", 14) else grad("#ffffff", "#e8f0ff", 14)
         }
         val all = Shared.logs
         val reds = all.count { it.level == 2 }
@@ -1648,12 +1648,12 @@ class MainActivity : Activity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(10), dp(7), dp(10), dp(7))
-                background = box(if (e.level == 2) "#2a1215" else "#161b22", if (e.level == 2) "#f85149" else if (e.level == 1) "#5c4813" else "#21262d", 8)
+                background = if (e.level == 2) grad("#fff1ef", "#ffd0ca", 16) else if (e.level == 1) grad("#fffaf0", "#ffeab8", 16) else grad("#ffffff", "#e8f0ff", 16)
                 layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(5) }
             }
             row.addView(TextView(this).apply {
                 text = "${e.time}   •   ${e.topics}"
-                setTextColor(c("#8b949e")); textSize = 11f
+                setTextColor(c("#64708a")); textSize = 11f
                 textDirection = View.TEXT_DIRECTION_LTR
             })
             row.addView(TextView(this).apply {
@@ -1686,7 +1686,7 @@ class MainActivity : Activity() {
             val dot = if (m.up) "🟢" else "🔴"
             row.addView(TextView(this).apply {
                 text = "$dot ${m.name}"
-                setTextColor(c("#e6edf3"))
+                setTextColor(c("#ffffff"))
                 textSize = 14f
                 setTypeface(null, Typeface.BOLD)
                 layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
@@ -1713,7 +1713,7 @@ class MainActivity : Activity() {
                 "إجمالي التحميل (RX): ${gb(item.totalRx)}\n" +
                 "إجمالي الرفع (TX): ${gb(item.totalTx)}"
 
-        AlertDialog.Builder(this)
+        AlertDialog.Builder(this, R.style.NMDialog)
             .setTitle("⚙️ التحكم بالمنفذ ${item.name}")
             .setMessage(msg)
             .setPositiveButton(if (item.disabled) "تفعيل المنفذ (Enable)" else "إيقاف المنفذ (Disable)") { _, _ ->
@@ -1757,7 +1757,7 @@ class MainActivity : Activity() {
     }
 
     private fun confirmKick(path: String, id: String, name: String) {
-        AlertDialog.Builder(this)
+        AlertDialog.Builder(this, R.style.NMDialog)
             .setTitle("فصل المتصل")
             .setMessage("هل تريد فصل ($name) ؟")
             .setPositiveButton("نعم، افصل") { _, _ -> kickUser(path, id, name) }
@@ -1778,7 +1778,7 @@ class MainActivity : Activity() {
     }
 
     private fun pingDialog(address: String, title: String) {
-        val pd = AlertDialog.Builder(this).setTitle(title).setMessage("جارٍ إرسال 4 نبضات Ping إلى $address...").show()
+        val pd = AlertDialog.Builder(this, R.style.NMDialog).setTitle(title).setMessage("جارٍ إرسال 4 نبضات Ping إلى $address...").show()
         Thread {
             try {
                 val r = Net.get(prefs)
@@ -1798,7 +1798,7 @@ class MainActivity : Activity() {
                 sb.append("\nالنتيجة النهائية: وصل $okCount من 4")
                 runOnUiThread {
                     pd.dismiss()
-                    AlertDialog.Builder(this).setTitle(title).setMessage(sb.toString()).setPositiveButton("حسناً", null).show()
+                    AlertDialog.Builder(this, R.style.NMDialog).setTitle(title).setMessage(sb.toString()).setPositiveButton("حسناً", null).show()
                 }
             } catch (e: Exception) {
                 runOnUiThread {
@@ -1810,7 +1810,7 @@ class MainActivity : Activity() {
     }
 
     private fun confirmRebootRouter() {
-        AlertDialog.Builder(this)
+        AlertDialog.Builder(this, R.style.NMDialog)
             .setTitle("⚠️ تأكيد إعادة تشغيل الراوتر")
             .setMessage("هل أنت متأكد من رغبتك في إعادة تشغيل الميكروتيك الرئيسي الآن؟ سينقطع الاتصال مؤقتاً.")
             .setPositiveButton("نعم، أعد التشغيل") { _, _ ->
@@ -1828,45 +1828,69 @@ class MainActivity : Activity() {
 
     private fun settings() {
         val defs = mapOf("port" to "8728", "wan" to "ether1", "modems" to DEFAULT_MODEMS)
-        val keys = listOf(
-            Triple("name", "🏷️ اسم الشبكة", "مثال: شبكة النور"),
-            Triple("local", "عنوان الراوتر المحلي", "192.168.88.1"),
-            Triple("cloud", "عنوان الكلاود (للمراقبة من خارج الشبكة)", "xxxx.sn.mynetname.net"),
-            Triple("port", "منفذ API", "8728"),
-            Triple("user", "اسم المستخدم", ""),
-            Triple("pass", "كلمة المرور", ""),
-            Triple("wan", "واجهة الإنترنت", "ether1"),
-            Triple("modems", "المودمات — سطر لكل مودم: IP والاسم", "90.90.2.2 شيبان")
-        )
-        val l = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18), dp(8), dp(18), dp(8)) }
-        val es = keys.map { (k, label, h) ->
-            l.addView(TextView(this).apply {
-                text = label; textSize = 12f; setTextColor(c("#8b949e")); setPadding(0, dp(10), 0, 0)
-            })
-            EditText(this).apply {
-                hint = h
-                setText(prefs.getString(k, null) ?: defs[k] ?: "")
-                if (k == "pass" && !prefs.getBoolean("remember", true)) setText("")
-                if (k == "pass") inputType = 129
-                if (k == "modems") { isSingleLine = false; minLines = 4; gravity = Gravity.TOP or Gravity.START } else isSingleLine = true
-                l.addView(this)
-            }
+        val d = android.app.Dialog(this, android.R.style.Theme_DeviceDefault_Light_NoActionBar)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(c("#EEF3FB"))
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
-        l.addView(TextView(this).apply {
-            text = "🔔 إشعارات سجل الراوتر (LOG)"; textSize = 13f; setTextColor(c("#8b949e"))
-            setTypeface(null, Typeface.BOLD); setPadding(0, dp(16), 0, dp(2))
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(8), dp(10), dp(8)); background = grad(NAV1, NAV2, 22)
+        }
+        head.addView(TextView(this).apply {
+            text = "⚙️ إعدادات الشبكة والمراقبة"; setTextColor(c("#ffffff")); textSize = 16f
+            setTypeface(null, Typeface.BOLD); layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         })
-        val cbErr = CheckBox(this).apply { text = "🔴 إشعار فوري عند أي خطأ أحمر (موصى به)"; isChecked = prefs.getBoolean("notif_err", true); l.addView(this) }
-        val cbWarn = CheckBox(this).apply { text = "🟡 إشعار للتحذيرات الصفراء أيضاً"; isChecked = prefs.getBoolean("notif_warn", false); l.addView(this) }
-
-        val cbRemember = CheckBox(this).apply { text = "🔐 تذكّر بيانات الدخول (اسم المستخدم وكلمة المرور)"; isChecked = prefs.getBoolean("remember", true); l.addView(this) }
-
-        AlertDialog.Builder(this).setTitle("⚙️ إعدادات الشبكة والمراقبة").setView(ScrollView(this).apply { addView(l) })
-            .setPositiveButton("حفظ واتصال") { _, _ ->
+        head.addView(TextView(this).apply {
+            text = "✖"; setTextColor(c("#ffffff")); textSize = 13f
+            setPadding(dp(12), dp(5), dp(12), dp(5)); background = grad("#1e6eff", "#0a32be", 14)
+            setOnClickListener { d.dismiss() }
+        })
+        root.addView(head)
+        val fields = HashMap<String, EditText>()
+        fun field(k: String, label: String, hint: String, multi: Boolean = false): FrameLayout {
+            val fr = FrameLayout(this)
+            val e = EditText(this).apply {
+                this.hint = hint; setHintTextColor(c("#a3adc2")); setTextColor(c("#1f2a44")); textSize = 14f
+                setText(prefs.getString(k, null) ?: defs[k] ?: "")
+                if (k == "pass") { inputType = 129; if (!prefs.getBoolean("remember", true)) setText("") }
+                if (multi) { isSingleLine = false; minLines = 3; maxLines = 4; gravity = Gravity.TOP or Gravity.START } else isSingleLine = true
+                setPadding(dp(12), dp(10), dp(12), dp(8)); background = box("#ffffff", "#9fb3d9", 14)
+            }
+            fields[k] = e
+            fr.addView(e, FrameLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            fr.addView(TextView(this).apply {
+                text = label; textSize = 11f; setTextColor(c("#1e6eff")); setBackgroundColor(c("#EEF3FB")); setPadding(dp(4), 0, dp(4), 0)
+            }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply { marginStart = dp(12) })
+            return fr
+        }
+        fun row(vararg cols: FrameLayout) {
+            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            cols.forEachIndexed { i, cl -> r.addView(cl, LinearLayout.LayoutParams(0, -2, 1f).apply { if (i > 0) leftMargin = dp(8) }) }
+            root.addView(r, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        }
+        row(field("name", "🏷️ اسم الشبكة", "شبكة النور"), field("wan", "واجهة الإنترنت", "ether1"))
+        row(field("local", "عنوان الراوتر (محلي)", "192.168.88.1"), field("cloud", "عنوان الكلاود (خارجي)", "xxxx.sn.mynetname.net"))
+        row(field("user", "اسم المستخدم", ""), field("pass", "كلمة المرور", ""), field("port", "منفذ API", "8728"))
+        row(field("modems", "المودمات: سطر لكل مودم (IP ثم الاسم)", "90.90.2.2 شيبان", true))
+        val cbRemember = CheckBox(this).apply { text = "🔐 تذكّر بيانات الدخول"; textSize = 13f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("remember", true) }
+        val cbErr = CheckBox(this).apply { text = "🔴 إشعار فوري عند أي خطأ أحمر في السجل"; textSize = 13f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("notif_err", true) }
+        val cbWarn = CheckBox(this).apply { text = "🟡 إشعار للتحذيرات الصفراء أيضاً"; textSize = 13f; setTextColor(c("#1f2a44")); isChecked = prefs.getBoolean("notif_warn", false) }
+        val checks = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(10), dp(4), dp(10), dp(4)); background = grad("#ffffff", "#e8f0ff", 16)
+            addView(cbRemember); addView(cbErr); addView(cbWarn)
+        }
+        root.addView(checks, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btns.addView(TextView(this).apply {
+            text = "حفظ واتصال"; setTextColor(c("#ffffff")); textSize = 15f; gravity = Gravity.CENTER; setTypeface(null, Typeface.BOLD)
+            setPadding(0, dp(12), 0, dp(12)); background = grad("#18be82", "#109664", 16)
+            setOnClickListener {
                 val e = prefs.edit()
-                keys.forEachIndexed { i, p -> e.putString(p.first, es[i].text.toString().trim()) }
-                e.putBoolean("remember", cbRemember.isChecked)
-                e.putBoolean("notif_err", cbErr.isChecked).putBoolean("notif_warn", cbWarn.isChecked)
+                for ((k, v) in fields) e.putString(k, v.text.toString().trim())
+                e.putBoolean("remember", cbRemember.isChecked).putBoolean("notif_err", cbErr.isChecked).putBoolean("notif_warn", cbWarn.isChecked)
                 e.apply()
                 tvTitle.text = "📡 ${netName(prefs)}"
                 Shared.cfgGen++
@@ -1878,7 +1902,18 @@ class MainActivity : Activity() {
                 lastSnap = null; lastModems = null
                 startMonitor()
                 askBatteryExemption(false)
-            }.setNegativeButton("إلغاء", null).show()
+                d.dismiss()
+            }
+        }, LinearLayout.LayoutParams(0, -2, 2f))
+        btns.addView(TextView(this).apply {
+            text = "إلغاء"; setTextColor(c("#1f2a44")); textSize = 15f; gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, dp(12)); background = grad("#ffffff", "#dbe6fb", 16)
+            setOnClickListener { d.dismiss() }
+        }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(8) })
+        root.addView(btns, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        d.setContentView(root)
+        d.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        d.show()
     }
 
 }
